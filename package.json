@@ -1,0 +1,10 @@
+{
+  "name": "pi-sdr",
+  "version": "1.0.0",
+  "description": "Web SDR for an SDRplay RSPduo on a Raspberry Pi: spectrum, waterfall, audio in the browser, scanner, memories, FM with RDS",
+  "main": "server.js",
+  "private": true,
+  "scripts": { "start": "node server.js", "build": "make -C engine" },
+  "dependencies": { "ws": "^8.18.0" },
+  "license": "MIT"
+}

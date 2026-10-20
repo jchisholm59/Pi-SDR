@@ -1,0 +1,5 @@
+node_modules/
+data/
+engine/sdr-engine
+# SDRplay's API headers are proprietary: install the API on the Pi instead (README)
+engine/sdrplay-inc/

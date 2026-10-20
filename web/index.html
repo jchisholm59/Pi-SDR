@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pi-SDR</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="icon.svg" alt=""><b>Pi-SDR</b><span class="sub" id="devname">RSPduo</span></div>
+  <div class="hstat">
+    <span id="conn" class="pill bad">connecting…</span>
+    <span id="ant" class="pill" title="Antenna in use"></span>
+    <span id="ovl" class="pill bad" hidden>OVERLOAD</span>
+    <span id="load" class="pill dim" title="Engine DSP load (one core)"></span>
+    <span id="who" class="pill dim" title="Browsers connected / listening"></span>
+  </div>
+</header>
+
+<main>
+  <section class="radio">
+    <div class="freqbox">
+      <div class="freq" id="freq" title="Scroll over a digit to change it, or click to type a frequency"></div>
+      <input id="freqIn" class="freqin" hidden placeholder="e.g. 101.3  7255k  1090M" autocomplete="off">
+      <div class="freqsub"><span id="bandName"></span><span id="stepLbl"></span></div>
+      <div class="identline" id="identLine" title="What's scheduled or assigned on this frequency (On air tab for more)"></div>
+    </div>
+    <div class="meters">
+      <div class="smeter" title="Signal level in the channel, and the noise level there">
+        <div class="sbar"><i id="sFill"></i><b id="sNoise"></b><b id="sSq"></b></div>
+        <div class="sscale"><span>S1</span><span>S3</span><span>S5</span><span>S7</span><span>S9</span><span>+20</span><span>+40</span></div>
+      </div>
+      <div class="sread"><b id="sVal">–</b><span id="snr"></span></div>
+      <div class="flags"><span id="fStereo" class="flag">STEREO</span><span id="fRds" class="flag">RDS</span><span id="fSq" class="flag">SQL</span><span id="fScan" class="flag">SCAN</span></div>
+    </div>
+    <div class="ctrl">
+      <div class="seg" id="modes"></div>
+      <label class="bw">BW <select id="bwSel"></select></label>
+      <label class="bw">Step <select id="stepSel"></select></label>
+    </div>
+    <div class="audio">
+      <button id="listen" class="big">▶ Listen</button>
+      <label class="vol" title="Volume">🔊 <input id="vol" type="range" min="0" max="1.5" step="0.01" value="0.8"></label>
+      <button id="mute" class="ic" title="Mute">🔇</button>
+      <button id="rec" class="ic" title="Record audio to a WAV file">⏺</button>
+      <label class="sq" title="Squelch: audio opens when the channel level is this far above its noise (Off = always open)">SQL <input id="sq" type="range" min="0" max="40" step="1" value="0"><span id="sqLbl">off</span></label>
+    </div>
+  </section>
+
+  <section class="rdsbar" id="rdsbar" hidden>
+    <div class="ps" id="rdsPs"></div>
+    <div class="rdsmid"><div class="rt" id="rdsRt"></div><div class="rdsmeta" id="rdsMeta"></div></div>
+    <button id="favNow" class="star" title="Add this station to the FM favourites">☆</button>
+  </section>
+
+  <section class="specwrap">
+    <div class="specbar">
+      <span class="grp">
+        <button class="ic" id="zoomOut" title="Zoom out">−</button>
+        <button class="ic" id="zoomIn" title="Zoom in">+</button>
+        <button id="zoomFit" title="Show the whole captured span">Full span</button>
+        <button id="zoomVfo" title="Centre the view on the tuned signal">Centre</button>
+      </span>
+      <span class="grp">Span <select id="spanSel" title="Hardware sample rate: how much spectrum is captured at once"></select></span>
+      <span class="grp">dB <input id="dbMin" type="number" value="-110" step="5"> to <input id="dbMax" type="number" value="-20" step="5"><button id="dbAuto" title="Fit the dB range to the signal">Auto</button></span>
+      <span class="grp"><label><input type="checkbox" id="peakHold"> Peak hold</label><label><input type="checkbox" id="showMem" checked> Labels</label>
+        <select id="palette" title="Waterfall colours"><option value="turbo">Turbo</option><option value="viridis">Viridis</option><option value="classic">Classic</option><option value="gray">Grey</option></select>
+        <select id="wfSpeed" title="Waterfall speed"><option value="1">WF 1×</option><option value="2">WF ½</option><option value="4">WF ¼</option></select></span>
+      <span class="grp right" id="specInfo"></span>
+    </div>
+    <div class="spectrum" id="specBox">
+      <canvas id="spec"></canvas>
+      <canvas id="bandStrip"></canvas>
+      <canvas id="wf"></canvas>
+      <div class="hover" id="hoverTip" hidden></div>
+    </div>
+    <div class="tuner">
+      <button class="ic" id="tDown" title="Down one step">◀</button>
+      <input type="range" id="tuneSlide" min="0" max="1000" value="500" title="Slide to tune across the visible spectrum">
+      <button class="ic" id="tUp" title="Up one step">▶</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <nav class="tabs" id="tabs">
+      <button data-tab="fm">FM radio</button>
+      <button data-tab="onair">On air</button>
+      <button data-tab="bands">Bands</button>
+      <button data-tab="mem">Memories</button>
+      <button data-tab="scan">Scanner</button>
+      <button data-tab="radio">Radio</button>
+      <button data-tab="log">Log</button>
+    </nav>
+
+    <div class="tab" data-tab="fm">
+      <div class="row">
+        <button id="fmScan" class="pri">Scan FM band</button>
+        <label><input type="checkbox" id="fmRds" checked> Identify by RDS (≈4 s per station)</label>
+        <label><input type="checkbox" id="fmFavOnly"> Favourites only</label>
+        <span class="muted" id="fmScanInfo"></span>
+      </div>
+      <div class="stations" id="fmList"></div>
+      <div class="rdsfull" id="rdsFull"></div>
+    </div>
+
+    <div class="tab" data-tab="onair">
+      <div class="card" style="margin-bottom:12px"><h3>On this frequency <span class="muted" id="hereFreq"></span></h3><div id="hereNow"></div></div>
+      <div class="row">
+        <select id="oaBand"></select>
+        <input id="oaLang" placeholder="Language (English, French…)" size="16">
+        <input id="oaText" placeholder="Station, country, target…" class="grow">
+        <label title="Show every scheduled broadcast in the band, not just the ones on air right now"><input type="checkbox" id="oaAll"> Whole schedule</label>
+      </div>
+      <div class="muted small" id="oaInfo"></div>
+      <div id="oaList" class="results" style="max-height:520px"></div>
+    </div>
+
+    <div class="tab" data-tab="bands"><div id="bandList"></div></div>
+
+    <div class="tab" data-tab="mem">
+      <div class="row">
+        <input id="memName" placeholder="Name" maxlength="60">
+        <input id="memGroup" placeholder="Group" list="memGroups" maxlength="40" value="General">
+        <datalist id="memGroups"></datalist>
+        <button id="memSave" class="pri">Save current</button>
+        <input id="memFilter" placeholder="Filter…" class="grow">
+        <a class="btn" href="/api/export" download>Export</a>
+        <label class="btn">Import<input type="file" id="memImport" accept=".json" hidden></label>
+      </div>
+      <div id="memList"></div>
+    </div>
+
+    <div class="tab" data-tab="scan">
+      <div class="cols">
+        <div class="card">
+          <h3>Search <span class="muted">sweep a range, list what's on the air</span></h3>
+          <div class="row"><select id="sPreset"></select></div>
+          <div class="row">
+            <label>From <input id="sStart" size="10"></label><label>to <input id="sStop" size="10"></label>
+            <label>Step <select id="sStep"></select></label>
+            <label>Mode <select id="sMode"></select></label>
+            <label title="How far above the noise a channel must be">Threshold <input id="sThr" type="number" value="10" min="3" max="40" style="width:4em"> dB</label>
+          </div>
+          <div class="row"><button id="sGo" class="pri">Search</button><button id="sCancel" hidden>Cancel</button><span class="muted" id="sInfo"></span></div>
+          <canvas id="sPlot" class="splot"></canvas>
+          <div class="row" id="sActions" hidden>
+            <input id="sGroup" placeholder="Memory group" value="Search">
+            <button id="sSaveSel">Save selected</button><button id="sSaveAll">Save all</button>
+            <button id="sScanThese">Scan these</button>
+          </div>
+          <div id="sResults" class="results"></div>
+        </div>
+        <div class="card">
+          <h3>Scanner <span class="muted">stop on activity, listen, move on</span></h3>
+          <div class="row">
+            <label>Scan <select id="cSource"><option value="range">a range</option><option value="memories">memories</option><option value="search">the last search</option></select></label>
+            <label id="cGroupL" hidden>Group <select id="cGroup"></select></label>
+          </div>
+          <div class="row" id="cRange">
+            <select id="cPreset"></select>
+            <label>From <input id="cStart" size="10"></label><label>to <input id="cStop" size="10"></label>
+            <label>Step <select id="cStep"></select></label><label>Mode <select id="cMode"></select></label>
+          </div>
+          <div class="row">
+            <label title="Signal must be this far above the noise to stop">Threshold <input id="cThr" type="number" value="10" min="3" max="40" style="width:4em"> dB</label>
+            <label title="Time on each channel">Dwell <input id="cDwell" type="number" value="150" min="80" step="10" style="width:5em"> ms</label>
+            <label title="Keep listening this long after the signal drops">Hang <input id="cHang" type="number" value="2" min="0" step="0.5" style="width:4em"> s</label>
+            <label title="Move on after this long even if it's still busy (0 = never)">Max <input id="cMax" type="number" value="0" min="0" style="width:4em"> s</label>
+          </div>
+          <div class="row">
+            <button id="cGo" class="pri">Start scanning</button><button id="cStop2">Stop</button>
+            <button id="cSkip">Skip</button><button id="cLock" title="Skip this frequency for the rest of the session">Lock out</button>
+            <button id="cSave" title="Save the current frequency to memories">Save</button>
+            <button id="cClearLock" title="Forget all lock-outs">Clear lock-outs</button>
+          </div>
+          <div class="scanstat" id="cStat"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab" data-tab="radio">
+      <div class="cols">
+        <div class="card">
+          <h3>Antenna</h3>
+          <div class="row"><label><input type="radio" name="ant" value="auto"> <b>Auto</b>: MLA-30 loop (tuner 2, bias-T on) below <input id="antSplit" type="number" value="30" min="1" max="200" style="width:4em"> MHz, multiband (tuner 1) above</label></div>
+          <div class="row"><label><input type="radio" name="ant" value="A"> Tuner 1 (multiband), 50 Ω</label></div>
+          <div class="row"><label><input type="radio" name="ant" value="AH"> Tuner 1, Hi-Z port</label></div>
+          <div class="row"><label><input type="radio" name="ant" value="B"> Tuner 2 (loop), 50 Ω</label><label><input type="checkbox" id="biasT"> Bias-T (powers the loop)</label></div>
+          <h3>Filters</h3>
+          <div class="row"><label><input type="checkbox" id="fmNotch"> FM broadcast notch</label><label><input type="checkbox" id="dabNotch"> DAB notch</label><label><input type="checkbox" id="amNotch"> MW notch (Hi-Z)</label></div>
+        </div>
+        <div class="card">
+          <h3>Gain</h3>
+          <div class="row"><label><input type="checkbox" id="agc"> IF AGC</label><label>target <input id="agcSet" type="number" value="-30" min="-72" max="-20" style="width:4em"> dBFS</label></div>
+          <div class="row"><label class="grow">LNA state <span id="lnaLbl"></span> <input id="lna" type="range" min="0" max="9" step="1"></label><label title="Raise the LNA state automatically while the RSPduo reports overload"><input type="checkbox" id="lnaAuto"> auto on overload</label></div>
+          <div class="row"><label class="grow">IF gain reduction <span id="grLbl"></span> <input id="gr" type="range" min="20" max="59" step="1"></label></div>
+          <div class="muted" id="gainInfo"></div>
+          <p class="muted small">LNA state 0 = most gain; each step up attenuates more. Near strong FM stations use 4 or higher (auto does this when OVERLOAD shows); the FM notch helps on other bands.</p>
+        </div>
+        <div class="card">
+          <h3>Receiver</h3>
+          <div class="row"><label>FFT size <select id="fftN"><option>1024</option><option>2048</option><option>4096</option><option>8192</option><option>16384</option></select></label>
+            <label>Frame rate <select id="fps"><option>10</option><option>15</option><option>20</option><option>25</option><option>30</option></select></label></div>
+          <div class="row"><label>PPM correction <input id="ppm" type="number" step="0.1" style="width:5em"></label>
+            <label>CW pitch <input id="cwPitch" type="number" step="10" style="width:5em"> Hz</label></div>
+          <div class="row"><label><input type="checkbox" id="stereo"> FM stereo</label>
+            <label>De-emphasis <select id="deemph"><option value="0.000075">75 µs (Americas)</option><option value="0.00005">50 µs (Europe)</option></select></label>
+            <label>FM grid <select id="fmGrid"><option value="na">North America (odd .1)</option><option value="eu">Every 100 kHz</option></select></label></div>
+          <div class="muted" id="engInfo"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab" data-tab="log">
+      <div class="row"><b>Scanner hits</b><button id="hitsClear">Clear</button></div>
+      <div id="hitList"></div>
+    </div>
+  </section>
+</main>
+<div id="toast" class="toast" hidden></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
