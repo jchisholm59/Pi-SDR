@@ -1,7 +1,7 @@
 // Pi-SDR web client: one shared radio over a WebSocket. Spectrum + waterfall with click / drag / wheel tuning and
 // zoom, a digit-wheel frequency display, audio played through Web Audio (scheduled buffers, so it works over plain
 // http on the LAN), WAV recording, RDS, band presets, memories, the search / scanner and the FM broadcast section.
-import { BANDS, CATS, COLORS, SCAN_PRESETS, PTY_RBDS, PTY_RDS, callsign } from './bands.js';
+import { BANDS, CATS, COLORS, SCAN_PRESETS, PTY_RBDS, PTY_RDS, HAM, callsign } from './bands.js';
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
@@ -62,6 +62,8 @@ let peak = null;
 const view = { start: 0, end: 0, auto: true }; // visible range in Hz
 let step = store.get('step', 0);
 let dropSeen = { n: null, t: 0, was: null };
+let recList = [];
+let decoder = { mode: 'off' }, decHist = { ft8: [], ft4: [], cw: '', aprs: [] }, survey = null;
 let identNow = null, onairItems = [], onairInfo = null, labelItems = [], labelRange = null;
 
 // ---- connection ---------------------------------------------------------------------------------------------------
@@ -118,12 +120,14 @@ function flushTune() {
 function onJson(m) {
   switch (m.type) {
     case 'state':
-      S = m.state;
+      S = { ...m.state, rec: m.rec, playback: m.playback };
       mems = m.memories || mems;
       fmList = m.fm || fmList;
       if (m.lastSearch) lastSearch = { ...m.lastSearch, spectrum: lastSearch?.spectrum };
       scanInfo = m.scan;
       fmScan = m.fmScan;
+      decoder = m.decoder || decoder;
+      if (m.survey && !survey) survey = m.survey;
       if (m.rds !== undefined) rds = m.rds;
       $('who').textContent = `${m.clients} connected · ${m.listeners} listening`;
       if (m.device) $('devname').textContent = `RSPduo ${m.device.serial}`;
@@ -174,6 +178,25 @@ function onJson(m) {
     case 'fmScan':
       fmScan = m.scan;
       renderFmScan();
+      break;
+    case 'decode':
+      onDecode(m);
+      break;
+    case 'decodeHistory':
+      decHist = m.history;
+      renderDecoder();
+      break;
+    case 'hamSurvey':
+      if (m.running) $('surveyInfo').textContent = `Sweeping ${m.band}…`;
+      else if (m.result) {
+        survey = m.result;
+        renderSurvey();
+      }
+      $('surveyGo').disabled = !!m.running;
+      break;
+    case 'recordings':
+      recList = m.list;
+      renderRecs();
       break;
     case 'ident':
       identNow = m;
@@ -309,12 +332,16 @@ function applyState() {
   renderFm();
   renderScan();
   renderFmScan();
+  renderHam();
+  renderDecoder();
+  renderRecState();
+  renderSurvey();
   if (lastSearch && !$('sResults').childElementCount) renderSearch();
   $('rdsbar').hidden = S.mode !== 'wfm';
 }
 function renderAnt() {
   if (!S) return;
-  const t = S.tuner === 'B' ? `Loop · tuner 2${S.biasT ? ' · bias-T' : ''}` : S.hiz ? 'Tuner 1 Hi-Z' : 'Multiband · tuner 1';
+  const t = S.tuner === 'B' ? `Loop · tuner 2${S.biasT ? ' · RSPduo bias-T ON' : ''}` : S.hiz ? 'Tuner 1 Hi-Z' : 'Multiband · tuner 1';
   $('ant').textContent = (S.antAuto ? 'Auto: ' : '') + t;
 }
 
@@ -346,6 +373,7 @@ function renderStatus() {
   $('fSq').classList.toggle('on', st.sq != null && !st.sqOpen);
   $('fScan').classList.toggle('on', !!scanInfo?.on);
   $('ovl').hidden = !st.overload;
+  renderPlayPos();
   // dropped samples: only worth showing while it's happening
   const now = Date.now();
   if (st.dropped !== dropSeen.n) dropSeen = { n: st.dropped, t: now, was: dropSeen.n };
@@ -456,15 +484,7 @@ $('mute').onclick = () => {
   $('mute').classList.toggle('on', player.muted);
   player.setVol();
 };
-$('rec').onclick = () => {
-  if (player.rec) return stopRec();
-  if (!player.on) return toast('Press Listen first: recording saves what you hear', true);
-  player.rec = [];
-  player.recFreq = S.freq;
-  player.recT = new Date();
-  $('rec').classList.add('on');
-  toast('Recording… press ⏺ again to save the WAV');
-};
+$('rec').onclick = () => cmd({ cmd: S?.rec?.audio ? 'recStop' : 'recStart', kind: 'audio' });
 function stopRec() {
   const parts = player.rec;
   player.rec = null;
@@ -961,6 +981,193 @@ $('oaList').onclick = (e) => {
 };
 setInterval(() => document.querySelector('.tab.on')?.dataset.tab === 'onair' && loadOnair(), 60000);
 
+// ---- ham ------------------------------------------------------------------------------------------------------------
+const sideband = (f) => (f < 10e6 ? 'lsb' : 'usb');
+function hamTune(f, mode, bw, stp) {
+  if (mode && (mode !== S.mode || (bw && bw !== S.bw))) cmd({ cmd: 'mode', mode, bw });
+  if (stp) {
+    step = stp;
+    store.set('step', step);
+    cmd({ cmd: 'set', step });
+  }
+  view.auto = true;
+  tuneTo(f, true);
+}
+function renderHam() {
+  if (!S) return;
+  $('hamBands').innerHTML = HAM.map((b, i) => {
+    const btn = (act, label, title) => `<button data-h="${i}" data-a="${act}" title="${title || ''}">${label}</button>`;
+    const bs = [];
+    if (b.cw) bs.push(btn('cw', 'CW'));
+    if (b.ssb) bs.push(btn('ssb', 'SSB'), `<button class="lock" data-h="${i}" data-a="scanssb" title="Auto-scan the SSB segment, lock on the first signal">🔒 SSB</button>`);
+    if (b.fm) bs.push(btn('fm', 'FM'), `<button class="lock" data-h="${i}" data-a="scanfm" title="Auto-scan the FM segment, lock on the first signal">🔒 FM</button>`);
+    if (b.ft8) bs.push(btn('ft8', 'FT8', 'Tune the FT8 dial frequency and start the decoder'));
+    if (b.ft4) bs.push(btn('ft4', 'FT4'));
+    if (b.aprs) bs.push(btn('aprs', 'APRS', 'Tune 144.390 and start the APRS decoder'));
+    const cur = S.freq >= b.start && S.freq <= b.stop;
+    return `<div class="hb${cur ? ' cur' : ''}"><div class="t"><b>${b.name}</b><span>${fmtMHz(b.start, 3)} – ${fmtMHz(b.stop, 3)}${b.hf ? ' · loop' : ''}</span></div><div class="b">${bs.join('')}</div>${
+      b.call ? `<div class="c">${b.call.map(([f, n]) => `<a data-f="${f}" title="${fmtMHz(f, 4)} MHz">${esc(n)}</a>`).join('')}</div>` : ''}</div>`;
+  }).join('');
+}
+$('hamBands').onclick = (e) => {
+  const a = e.target.closest('[data-f]');
+  if (a) {
+    const f = Number(a.dataset.f), m = f > 30e6 && f < 1300e6 && !/SSB|CW/.test(a.textContent) ? 'nfm' : /CW/.test(a.textContent) ? 'cw' : sideband(f);
+    return hamTune(f, m, m === 'nfm' ? 12500 : undefined);
+  }
+  const t = e.target.closest('[data-h]');
+  if (!t) return;
+  const b = HAM[Number(t.dataset.h)], act = t.dataset.a;
+  if (act === 'cw') return hamTune(b.cw[0] + (b.cw[1] - b.cw[0]) * 0.3, 'cw', 500, 100);
+  if (act === 'ssb') return hamTune((b.ssb[0] + b.ssb[1]) / 2, b.ssb[2], 2700, 500);
+  if (act === 'fm') return hamTune(b.call?.find(([, n]) => /FM simplex/.test(n))?.[0] || b.fm[0], 'nfm', 12500, b.fm[2]);
+  if (act === 'ft8' || act === 'ft4') return cmd({ cmd: 'decoderStart', mode: act, dial: b[act] });
+  if (act === 'aprs') return cmd({ cmd: 'decoderStart', mode: 'aprs', dial: b.aprs });
+  if (act === 'scanssb') {
+    cmd({ cmd: 'scanStart', source: 'range', start: b.ssb[0], stop: b.ssb[1], step: 1000, mode: b.ssb[2], threshold: 10, dwell: 150, hang: 3000, onHit: 'lock' });
+    toast(`Scanning ${b.name} SSB; it will lock on the first signal (Scanner tab: Resume to move on)`);
+  }
+  if (act === 'scanfm') {
+    cmd({ cmd: 'scanStart', source: 'range', start: b.fm[0], stop: b.fm[1], step: b.fm[2], mode: 'nfm', threshold: 10, dwell: 150, hang: 3000, onHit: 'lock' });
+    toast(`Scanning ${b.name} FM; it will lock on the first signal`);
+  }
+};
+
+// decoders
+const FT8_DIALS = HAM.filter((b) => b.ft8).map((b) => [b.ft8, b.name]);
+const FT4_DIALS = HAM.filter((b) => b.ft4).map((b) => [b.ft4, b.name]);
+function renderDecoder() {
+  const mode = decoder?.mode || 'off';
+  for (const b of $('decModes').children) b.classList.toggle('on', b.dataset.dec === mode);
+  const dials = mode === 'ft4' ? FT4_DIALS : FT8_DIALS;
+  $('decDialL').hidden = !(mode === 'ft8' || mode === 'ft4');
+  $('decDial').innerHTML = dials.map(([f, n]) => `<option value="${f}" ${S && Math.abs(S.freq - f) < 1000 ? 'selected' : ''}>${n} · ${fmtMHz(f, 3)}</option>`).join('');
+  $('decState').textContent = mode === 'off' ? 'off' : `${mode.toUpperCase()} running on ${S ? fmtMHz(S.freq, 4) : ''} MHz`;
+  $('decHelp').textContent = {
+    off: 'FT8 / FT4: tunes the dial frequency in USB and decodes every 15 s (7.5 s) slot. CW: decodes whatever you tune in CW mode. APRS: 144.390 MHz packets. Decoders run on the Pi, whether or not you are listening.',
+    ft8: 'Decoding each 15 s slot (needs the Pi clock in sync, it is). Green = CQ calls. Distance and bearing from Hubley.',
+    ft4: 'Decoding each 7.5 s slot.',
+    cw: 'Tune a CW signal (the decoder finds the tone between 300 and 1200 Hz).',
+    aprs: 'Listening on 144.390 MHz for APRS packets.',
+  }[mode];
+  if (decoder?.available && !decoder.available.ft8 && (mode === 'ft8' || mode === 'ft4')) $('decHelp').textContent = 'FT8 decoder not installed on the Pi (see README).';
+  const out = $('decOut');
+  if (mode === 'ft8' || mode === 'ft4') {
+    const rows = decHist[mode] || [];
+    out.innerHTML = rows.length
+      ? `<table><thead><tr><th>UTC</th><th>dB</th><th>DT</th><th>Hz</th><th>Message</th><th>Country</th><th>km</th></tr></thead><tbody>${rows.slice(0, 300).map((d) =>
+          `<tr class="${d.cq ? 'cq' : ''}"><td class="mono">${new Date(d.t).toISOString().slice(11, 19)}</td><td class="mono">${d.snr}</td><td class="mono">${d.dt.toFixed(1)}</td><td class="mono">${d.df}</td><td class="mono">${esc(d.msg)}</td><td>${esc(d.country || '')}</td><td class="mono">${d.km != null ? `${d.km} <span class="muted">${d.brg}°</span>` : ''}</td></tr>`).join('')}</tbody></table>`
+      : '<div class="muted">Waiting for the end of the first slot…</div>';
+  } else if (mode === 'cw') {
+    out.innerHTML = `<div class="muted small" id="cwMeta"></div><div class="cwtext" id="cwText">${esc(decHist.cw || '')}</div>`;
+  } else if (mode === 'aprs') {
+    const rows = decHist.aprs || [];
+    out.innerHTML = rows.length
+      ? `<table><thead><tr><th>Time</th><th>From</th><th>Kind</th><th>km</th><th>Comment / data</th></tr></thead><tbody>${rows.slice(0, 300).map((p) =>
+          `<tr title="${esc(p.from)}>${esc(p.to)},${esc(p.path)}:${esc(p.info)}"><td class="mono">${new Date(p.t).toLocaleTimeString()}</td><td><b>${esc(p.from)}</b></td><td>${esc(p.kind)}</td><td class="mono">${p.km != null ? `${p.km} <span class="muted">${p.brg}°</span>` : ''}</td><td>${esc(p.comment || p.info)}</td></tr>`).join('')}</tbody></table>`
+      : '<div class="muted">Waiting for packets on 144.390…</div>';
+  } else out.innerHTML = '';
+}
+function onDecode(m) {
+  if (m.mode === 'cw') {
+    decHist.cw = (decHist.cw + m.add).slice(-3000);
+    const t = $('cwText');
+    if (t) {
+      t.textContent = decHist.cw;
+      t.scrollTop = t.scrollHeight;
+    }
+    if ($('cwMeta')) $('cwMeta').textContent = `≈ ${m.wpm} WPM · tone ${m.tone} Hz`;
+    return;
+  }
+  decHist[m.mode] = [...m.items.slice().reverse(), ...(decHist[m.mode] || [])].slice(0, 500);
+  if (decoder.mode === m.mode) renderDecoder();
+}
+$('decModes').onclick = (e) => {
+  const b = e.target.closest('[data-dec]');
+  if (!b) return;
+  const mode = b.dataset.dec;
+  if (mode === 'off') return cmd({ cmd: 'decoderStop' });
+  const dial = mode === 'ft8' ? (FT8_DIALS.find(([f]) => Math.abs(S.freq - f) < 200e3)?.[0] || 14.074e6) : mode === 'ft4' ? (FT4_DIALS.find(([f]) => Math.abs(S.freq - f) < 200e3)?.[0] || 14.08e6) : undefined;
+  cmd({ cmd: 'decoderStart', mode, dial });
+};
+$('decDial').onchange = (e) => cmd({ cmd: 'decoderStart', mode: decoder.mode, dial: Number(e.target.value) });
+
+// band survey
+$('surveyGo').onclick = () => cmd({ cmd: 'hamSurvey' });
+function renderSurvey() {
+  const r = survey;
+  if (!r) {
+    $('survey').innerHTML = '<div class="muted">Not run yet.</div>';
+    return;
+  }
+  $('surveyInfo').textContent = `${new Date(r.t).toLocaleTimeString()} · ${(r.took / 1000).toFixed(0)} s`;
+  const max = Math.max(5, ...r.bands.map((b) => b.count));
+  $('survey').innerHTML = r.bands.map((b) => `<div class="sb" data-band="${esc(b.name)}"><b>${b.name}</b><span><i style="width:${(b.count / max) * 100}%"></i></span><small>${b.count}</small>
+    <div class="tops">${b.top.map((c) => `<a data-f="${c.freq}">${fmtMHz(c.freq, 3)} <span>+${Math.round(c.snr)}</span></a>`).join('') || 'quiet'}</div></div>`).join('');
+}
+$('survey').onclick = (e) => {
+  const a = e.target.closest('[data-f]');
+  if (!a) return;
+  const f = Number(a.dataset.f);
+  hamTune(f, f > 30e6 ? 'usb' : sideband(f), 2700, 500);
+};
+
+// ---- recordings ---------------------------------------------------------------------------------------------------
+const fmtDur = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const fmtSize = (b) => (b > 1e9 ? `${(b / 1e9).toFixed(2)} GB` : b > 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.round(b / 1e3)} kB`);
+async function loadRecs() {
+  try {
+    const j = await fetch('api/recordings').then((r) => r.json());
+    recList = j.list;
+    $('recInfo').textContent = `${fmtSize(j.free)} free on the Pi`;
+    renderRecs();
+  } catch (e) {}
+}
+function renderRecState() {
+  const r = S?.rec || {};
+  $('rec').classList.toggle('on', !!r.audio);
+  $('recAudio').textContent = r.audio ? '■ Stop audio recording' : '⏺ Record audio';
+  $('recAudio').classList.toggle('on', !!r.audio);
+  $('recIq').textContent = r.iq ? '■ Stop IQ recording' : '⏺ Record IQ (spectrum)';
+  $('recIq').disabled = !!S?.playback;
+  $('recPill').hidden = !(r.audio || r.iq);
+  $('recPill').textContent = `● REC ${r.audio ? 'audio' : ''}${r.audio && r.iq ? ' + ' : ''}${r.iq ? 'IQ' : ''}`;
+  const pb = S?.playback;
+  $('playbar').hidden = !pb;
+  if (pb) $('playName').textContent = `${fmtMHz(pb.meta.lo, 3)} MHz ± ${(pb.meta.fs / 2e6).toFixed(1)} · ${new Date(pb.meta.t).toLocaleString()} · tune anywhere inside it`;
+}
+function renderPlayPos() {
+  if (!st.playing || document.activeElement === $('playPos')) return;
+  $('playPos').value = String(st.playLen ? Math.round((st.playPos / st.playLen) * 1000) : 0);
+  $('playTime').textContent = `${fmtDur(st.playPos)} / ${fmtDur(st.playLen)}`;
+  $('playPause').textContent = st.paused ? '▶' : '⏸';
+  if (st.iqRec) $('recPill').textContent = `● REC IQ ${fmtDur(st.iqRecSec)}`;
+}
+$('playPause').onclick = () => cmd({ cmd: 'playPause' });
+$('playStop').onclick = () => cmd({ cmd: 'playStop' });
+$('playPos').onchange = (e) => cmd({ cmd: 'playSeek', sec: (Number(e.target.value) / 1000) * (st.playLen || 0) });
+$('recAudio').onclick = () => cmd({ cmd: S?.rec?.audio ? 'recStop' : 'recStart', kind: 'audio' });
+$('recIq').onclick = () => cmd(S?.rec?.iq ? { cmd: 'recStop', kind: 'iq' } : { cmd: 'recStart', kind: 'iq', maxSec: Number($('recIqMax').value) * 60 });
+function renderRecs() {
+  $('recList').innerHTML = recList.length
+    ? `<table><thead><tr><th></th><th>When</th><th>Frequency</th><th>Mode</th><th>Station</th><th>Length</th><th>Size</th><th></th></tr></thead><tbody>${recList.map((r) => `<tr class="recrow">
+        <td><span class="reckind ${r.kind}">${r.kind === 'iq' ? 'IQ' : 'AUDIO'}</span></td><td class="mono">${new Date(r.t).toLocaleString()}</td>
+        <td class="mono">${fmtMHz(r.freq, 4)}${r.kind === 'iq' ? ` <span class="muted">(± ${(r.fs / 2e6).toFixed(1)} MHz)</span>` : ''}</td><td>${(r.mode || '').toUpperCase()}</td><td>${esc(r.ps || '')}</td>
+        <td class="mono">${fmtDur(r.dur || 0)}</td><td class="mono">${fmtSize(r.size)}</td>
+        <td><span class="act">${r.kind === 'iq' ? `<button data-play="${r.file}">▶ Play in radio</button>` : `<button data-listen="${r.file}">▶ Play</button>`}<a class="btn" href="rec/${r.file}?dl=1">⬇</a><button data-del="${r.file}">🗑</button></span>
+        <span data-player="${r.file}"></span></td></tr>`).join('')}</tbody></table>`
+    : '<div class="muted">No recordings yet.</div>';
+}
+$('recList').onclick = (e) => {
+  const t = e.target;
+  if (t.dataset.play) return cmd({ cmd: 'playStart', file: t.dataset.play });
+  if (t.dataset.del) return confirm(`Delete ${t.dataset.del}?`) && cmd({ cmd: 'recDelete', file: t.dataset.del });
+  if (t.dataset.listen) {
+    const box = document.querySelector(`[data-player="${t.dataset.listen}"]`);
+    box.innerHTML = `<audio controls autoplay src="rec/${t.dataset.listen}"></audio>`;
+  }
+};
+
 // ---- tabs ---------------------------------------------------------------------------------------------------------
 function setTab(t) {
   for (const b of $('tabs').children) b.classList.toggle('on', b.dataset.tab === t);
@@ -968,6 +1175,7 @@ function setTab(t) {
   store.set('tab', t);
   if (t === 'scan') requestAnimationFrame(drawSearchPlot); // canvases in a hidden tab have no size
   if (t === 'onair') loadOnair();
+  if (t === 'rec') loadRecs();
 }
 $('tabs').onclick = (e) => {
   const b = e.target.closest('button');
@@ -1174,12 +1382,14 @@ $('cSource').onchange = () => {
 };
 $('cGo').onclick = () => {
   const src = $('cSource').value;
-  const m = { cmd: 'scanStart', source: src, threshold: Number($('cThr').value), dwell: Number($('cDwell').value), hang: Number($('cHang').value) * 1000, maxListen: Number($('cMax').value) * 1000 };
+  const m = { cmd: 'scanStart', source: src, threshold: Number($('cThr').value), dwell: Number($('cDwell').value), hang: Number($('cHang').value) * 1000, maxListen: Number($('cMax').value) * 1000, onHit: $('cOnHit').value };
   if (src === 'range') Object.assign(m, { start: formFreq('cStart'), stop: formFreq('cStop'), step: Number($('cStep').value), mode: $('cMode').value });
   if (src === 'memories') m.group = $('cGroup').value || null;
   cmd(m);
 };
 $('cStop2').onclick = () => cmd({ cmd: 'scanStop' });
+$('cHold').onclick = () => cmd({ cmd: 'scanHold' });
+$('cResume').onclick = () => cmd({ cmd: 'scanResume' });
 $('cSkip').onclick = () => cmd({ cmd: 'scanSkip' });
 $('cLock').onclick = () => cmd({ cmd: 'scanSkip', lockout: true });
 $('cSave').onclick = () => cmd({ cmd: 'memorySave', name: '', group: 'Scanner' });
@@ -1193,8 +1403,8 @@ function renderScan() {
     return;
   }
   const cur = s.cur;
-  $('cStat').innerHTML = `${s.phase === 'listen' ? '<b style="color:var(--good)">● ACTIVE</b>' : '<span class="muted">scanning</span>'} ${cur ? fmtMHz(cur.freq, 4) + ' MHz' : ''} ${cur?.name ? '· ' + esc(cur.name) : ''}
-    <span class="muted"> · channel ${s.idx + 1} of ${s.n}</span>`;
+  $('cStat').innerHTML = `${s.phase === 'locked' ? '<b style="color:var(--acc2)">🔒 LOCKED</b>' : s.phase === 'listen' ? '<b style="color:var(--good)">● ACTIVE</b>' : '<span class="muted">scanning</span>'} ${cur ? fmtMHz(cur.freq, 4) + ' MHz' : ''} ${cur?.name ? '· ' + esc(cur.name) : ''}
+    <span class="muted"> · channel ${s.idx + 1} of ${s.n}${s.phase === 'locked' ? ' · press Resume (or Skip) to carry on' : ''}</span>`;
 }
 function renderHits() {
   $('hitList').innerHTML = hits.length
@@ -1215,7 +1425,7 @@ for (const r of document.querySelectorAll('input[name=ant]')) {
   r.onchange = () => {
     const v = r.value;
     if (v === 'auto') cmd({ cmd: 'set', antAuto: true });
-    else cmd({ cmd: 'set', antAuto: false, tuner: v === 'B' ? 'B' : 'A', hiz: v === 'AH', biasT: v === 'B' ? $('biasT').checked || true : false });
+    else cmd({ cmd: 'set', antAuto: false, tuner: v === 'B' ? 'B' : 'A', hiz: v === 'AH', biasT: v === 'B' ? $('biasT').checked : false });
   };
 }
 $('antSplit').onchange = (e) => cmd({ cmd: 'set', antSplit: Number(e.target.value) * 1e6 });

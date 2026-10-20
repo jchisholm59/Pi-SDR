@@ -27,13 +27,25 @@ and the radio, the spectrum and the audio come to you. Covers everything the RSP
   language or station, tap to tune; on-air stations are labelled on the spectrum.
 - **Search**: sweep any range (the whole 1 kHz – 2 GHz takes about a minute), list the active channels on a grid with
   their level above the noise, listen, save selected or all to memories.
-- **Scanner**: step through a range, a memory group or the last search; stops on activity, listens until the signal
-  has been gone for the hang time, moves on; skip, lock out (remembered), save; every stop logged.
+- **Scanner**: step through a range, a memory group or the last search; stops on activity and either listens until the
+  signal has been gone for the hang time and moves on, or **locks on it** until you press Resume; Hold, Skip, lock out
+  (remembered), save; every stop logged.
+- **Ham** tab: every amateur band from 160 m to 23 cm with one-tap CW / SSB / FM / FT8 / FT4 segments and calling
+  frequencies (LSB below 10 MHz, USB above); **🔒 auto-scan** of a band's SSB or FM segment that **locks on the first
+  signal**; an **HF band survey** that sweeps 160 - 6 m in about 7 s and shows how busy each band is.
+- **Decoders** (run on the Pi, whether or not anyone is listening): **FT8 / FT4** with
+  [ft8_lib](https://github.com/kgoba/ft8_lib) (15 / 7.5 s UTC slots, calls, grids, country, distance and bearing),
+  **CW** (Morse to text, tone found automatically, WPM estimate), **APRS** on 144.390 through multimon-ng (positions
+  incl. Mic-E with altitude and radio model, distance and bearing, digipeated copies dropped). History survives restarts.
+- **Recordings**: ⏺ records what you hear on the Pi (WAV), and **IQ recording** saves the whole captured span. **Play
+  in radio** loads an IQ recording instead of the RSPduo: tune and demodulate anything inside it, any mode, with
+  spectrum, waterfall, RDS and decoders working, seek / pause, then back to live. Audio recordings play in the browser;
+  both download.
 - **Memories** in groups, recall, edit, lock out, export / import (JSON).
 - **Bands**: presets for broadcast LW/MW/SW/FM, time & weather (CHU, WWV, Weatheradio, CFH fax), aviation, marine,
   every amateur band, CB, FRS/GMRS, land mobile, railway, ISM, space.
-- **Antennas**: auto switching for this station: below 30 MHz the MLA-30 active loop on **tuner 2 with the bias-T
-  on**, above it the multiband antenna on **tuner 1**. Or pick tuner 1, tuner 1 Hi-Z or tuner 2 yourself. Each
+- **Antennas**: auto switching for this station: below 30 MHz the MLA-30 active loop on **tuner 2** (powered by its own external
+  injector, so the RSPduo's bias-T stays off), above it the multiband antenna on **tuner 1**. Or pick tuner 1, tuner 1 Hi-Z or tuner 2 yourself. Each
   antenna keeps its own LNA setting.
 - **Gain**: IF AGC (setpoint), LNA state, IF gain reduction, FM / DAB / MW notches, PPM correction, and automatic LNA
   attenuation when the RSPduo reports overload.
@@ -50,6 +62,16 @@ broadcast on air in the band.
 **Scanner**: a 2.4-second air-band search with its sweep plot and results (listen, save, scan them), and the scanner.
 
 ![Scanner tab: air band search results and the scanner settings](docs/scanner.png)
+
+**Ham**: the bands with tune / auto-scan-and-lock buttons, the decoder (here APRS: two Mic-E mobiles with distance and
+bearing) and the HF band survey.
+
+![Ham tab: amateur bands, APRS decoder, HF band survey](docs/ham.png)
+
+**IQ playback**: a 12-second IQ recording made on 101.3 played back and retuned inside it to 100.1, with stereo and
+RDS decoding from the file.
+
+![IQ playback bar over the spectrum, Recordings tab](docs/recordings.png)
 
 **Radio**: antenna (auto loop / multiband), gain and receiver settings.
 
@@ -74,6 +96,9 @@ RSPduo ──USB── sdrplay_apiService ── engine/sdr-engine (C++) ──p
   signal off the DC spike), the auto antenna and LNA, search / scanner / FM identification, memories and
   favourites (JSON files in `data/`), and fans the radio out to browsers.
 - **`ident.js`**: the station identifier (EiBi, OurAirports, fixed tables).
+- **`decoders.js`**: FT8 / FT4 (slots to ft8_lib), CW (Goertzel + timing), APRS (multimon-ng, position parsing).
+- IQ recordings are raw interleaved int16 at the span's sample rate with a JSON sidecar (centre frequency, retunes).
+  Playback is a thread in the engine that feeds the file into the same queue as the RSPduo, in real time.
 - **`web/`**: the browser app (plain JS modules, no build step).
 
 ## Install (Raspberry Pi OS / Debian, arm64)
@@ -86,8 +111,10 @@ RSPduo ──USB── sdrplay_apiService ── engine/sdr-engine (C++) ──p
    `sdrplay.service` systemd unit, then `ldconfig` and `systemctl enable --now sdrplay`.
 2. `sudo apt install build-essential nodejs npm libfftw3-dev` and `sudo npm install -g pm2`
 3. Copy this folder to the Pi (e.g. `~/pi-sdr`), then `make -C engine && npm install`
-4. `pm2 start ecosystem.config.js && pm2 save`, and once `pm2 startup` (run the line it prints as root).
-5. Open `http://<pi>:8073/`, press **Listen**.
+4. Decoders: `sudo apt install multimon-ng` (APRS) and `git clone https://github.com/kgoba/ft8_lib ~/ft8_lib && make -C ~/ft8_lib`
+   (FT8 / FT4; `FT8_DECODER` overrides the path). FT8 needs the clock in sync (`timedatectl`: NTP active).
+5. `pm2 start ecosystem.config.js && pm2 save`, and once `pm2 startup` (run the line it prints as root).
+6. Open `http://<pi>:8073/`, press **Listen**.
 
 From a desktop with this repo: `./deploy.sh` (copies to `root@192.168.2.94:/home/jim/pi-sdr`, rebuilds, restarts).
 
@@ -97,7 +124,8 @@ Hubley NS by default), `AIR_RADIUS_KM` (250).
 ## API
 
 `GET /api/state`, `/api/status` (levels, gain, load), `/api/memories`, `/api/fm`, `/api/search`, `/api/hits`,
-`/api/ident?f=<Hz>`, `/api/onair?start=&end=[&all=1]`, `/api/export`; `POST /api/import`. Everything else goes over
+`/api/ident?f=<Hz>`, `/api/onair?start=&end=[&all=1]`, `/api/recordings`, `/rec/<file>` (Range), `/api/export`;
+`POST /api/import`. Everything else goes over
 the WebSocket at `/ws` (JSON commands: `tune`, `mode`, `set`, `audio`, `search`, `scanStart`, `fmScan`, …).
 
 ## Notes

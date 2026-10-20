@@ -112,3 +112,24 @@ export function callsign(pi) {
   if ((pi & 0xf000) === 0xc000) return 'Canada';
   return '';
 }
+
+// Amateur bands (IARU Region 2 / Canada) for the Ham tab: segments to tune or auto-scan, FT8 / FT4 dial frequencies,
+// calling frequencies. hf: on the loop antenna (below 30 MHz).
+export const HAM = [
+  { name: '160 m', start: 1.8e6, stop: 2.0e6, hf: true, cw: [1.8e6, 1.84e6], ssb: [1.843e6, 2.0e6, 'lsb'], ft8: 1.84e6, call: [[1.81e6, 'CW QRP'], [1.91e6, 'SSB']] },
+  { name: '80 m', start: 3.5e6, stop: 4.0e6, hf: true, cw: [3.5e6, 3.6e6], ssb: [3.6e6, 4.0e6, 'lsb'], ft8: 3.573e6, ft4: 3.575e6, call: [[3.56e6, 'CW QRP'], [3.985e6, 'SSB'], [3.7e6, 'Maritime nets']] },
+  { name: '60 m', start: 5.3305e6, stop: 5.4065e6, hf: true, ssb: [5.33e6, 5.41e6, 'usb'], ft8: 5.357e6, call: [[5.3305e6, 'Ch 1'], [5.3465e6, 'Ch 2'], [5.357e6, 'Ch 3'], [5.3715e6, 'Ch 4'], [5.4035e6, 'Ch 5']] },
+  { name: '40 m', start: 7.0e6, stop: 7.3e6, hf: true, cw: [7.0e6, 7.125e6], ssb: [7.125e6, 7.3e6, 'lsb'], ft8: 7.074e6, ft4: 7.0475e6, call: [[7.03e6, 'CW QRP'], [7.285e6, 'SSB QRP']] },
+  { name: '30 m', start: 10.1e6, stop: 10.15e6, hf: true, cw: [10.1e6, 10.13e6], ft8: 10.136e6, ft4: 10.14e6, call: [[10.106e6, 'CW QRP']] },
+  { name: '20 m', start: 14.0e6, stop: 14.35e6, hf: true, cw: [14.0e6, 14.15e6], ssb: [14.15e6, 14.35e6, 'usb'], ft8: 14.074e6, ft4: 14.08e6, call: [[14.06e6, 'CW QRP'], [14.23e6, 'SSTV'], [14.285e6, 'SSB QRP'], [14.3e6, 'Maritime mobile net']] },
+  { name: '17 m', start: 18.068e6, stop: 18.168e6, hf: true, cw: [18.068e6, 18.11e6], ssb: [18.11e6, 18.168e6, 'usb'], ft8: 18.1e6, ft4: 18.104e6 },
+  { name: '15 m', start: 21.0e6, stop: 21.45e6, hf: true, cw: [21.0e6, 21.2e6], ssb: [21.2e6, 21.45e6, 'usb'], ft8: 21.074e6, ft4: 21.14e6, call: [[21.06e6, 'CW QRP'], [21.385e6, 'SSB QRP']] },
+  { name: '12 m', start: 24.89e6, stop: 24.99e6, hf: true, cw: [24.89e6, 24.93e6], ssb: [24.93e6, 24.99e6, 'usb'], ft8: 24.915e6, ft4: 24.919e6 },
+  { name: '10 m', start: 28.0e6, stop: 29.7e6, hf: true, cw: [28.0e6, 28.3e6], ssb: [28.3e6, 29.0e6, 'usb'], fm: [29.5e6, 29.7e6, 10000], ft8: 28.074e6, ft4: 28.18e6, call: [[28.4e6, 'SSB calling'], [29.6e6, 'FM simplex']] },
+  { name: '6 m', start: 50.0e6, stop: 54.0e6, cw: [50.0e6, 50.1e6], ssb: [50.1e6, 50.3e6, 'usb'], fm: [51.0e6, 54.0e6, 20000], ft8: 50.313e6, ft4: 50.318e6, call: [[50.125e6, 'SSB calling'], [52.525e6, 'FM simplex']] },
+  { name: '2 m', start: 144.0e6, stop: 148.0e6, cw: [144.0e6, 144.1e6], ssb: [144.1e6, 144.3e6, 'usb'], fm: [144.5e6, 148.0e6, 5000], ft8: 144.174e6, aprs: 144.39e6, call: [[144.2e6, 'SSB calling'], [146.52e6, 'FM simplex calling'], [145.8e6, 'ISS downlink'], [144.39e6, 'APRS']] },
+  { name: '1.25 m', start: 222.0e6, stop: 225.0e6, ssb: [222.0e6, 222.15e6, 'usb'], fm: [223.4e6, 225.0e6, 20000], call: [[222.1e6, 'SSB calling'], [223.5e6, 'FM simplex']] },
+  { name: '70 cm', start: 430.0e6, stop: 450.0e6, ssb: [432.0e6, 432.3e6, 'usb'], fm: [440.0e6, 450.0e6, 12500], ft8: 432.174e6, call: [[432.1e6, 'SSB calling'], [446.0e6, 'FM simplex calling']] },
+  { name: '33 cm', start: 902.0e6, stop: 928.0e6, ssb: [903.0e6, 903.2e6, 'usb'], fm: [927.0e6, 928.0e6, 12500], call: [[903.1e6, 'SSB calling'], [927.5e6, 'FM simplex']] },
+  { name: '23 cm', start: 1240e6, stop: 1300e6, ssb: [1296.0e6, 1296.2e6, 'usb'], fm: [1294.0e6, 1295.0e6, 25000], call: [[1296.1e6, 'SSB calling'], [1294.5e6, 'FM simplex']] },
+];

@@ -633,6 +633,100 @@ struct Sweep {
   double outStart = 0, outStep = 0;
 };
 
+// ---- IQ recording and playback ------------------------------------------------------------------------------------
+// Recording: the raw IQ as interleaved int16 (as the RSPduo delivers it) to a file the server names, plus retune
+// events "sample:lo,..." so playback knows the centre frequency at every point. Playback: a thread reads the file at
+// real time into the same queue the device fills, so spectrum, demodulators, RDS and decoders all work, and the
+// listening frequency can be moved anywhere inside the recorded span.
+static FILE *iqRec = nullptr;
+static std::string iqRecPath, iqEvents;
+static long long iqRecN = 0;
+static double iqRecMaxSec = 300;
+
+struct Player {
+  std::thread th;
+  std::atomic<bool> run{false}, paused{false};
+  std::atomic<long long> pos{0}, seekTo{-1};
+  long long total = 0;
+  std::string path;
+  bool loop = false;
+  double fs = 2.4e6;
+  std::vector<std::pair<long long, double>> events; // (sample, lo)
+  std::atomic<double> lo{0};
+} player;
+static bool playing = false;
+
+static double loAt(long long smp) {
+  double lo = player.events.empty() ? S.lo : player.events[0].second;
+  for (auto &e : player.events)
+    if (e.first <= smp) lo = e.second;
+  return lo;
+}
+static void playerLoop() {
+  FILE *f = fopen(player.path.c_str(), "rb");
+  if (!f) {
+    logMsg("error", "can't open " + player.path);
+    player.run = false;
+    return;
+  }
+  size_t chunk = (size_t)(player.fs / 100); // 10 ms
+  std::vector<int16_t> buf(chunk * 2);
+  auto next = std::chrono::steady_clock::now();
+  while (player.run) {
+    if (player.paused) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      next = std::chrono::steady_clock::now();
+      continue;
+    }
+    long long sk = player.seekTo.exchange(-1);
+    if (sk >= 0) {
+      fseeko(f, (off_t)sk * 4, SEEK_SET);
+      player.pos = sk;
+    }
+    size_t got = fread(buf.data(), 4, chunk, f);
+    if (got == 0) {
+      if (player.loop) {
+        fseeko(f, 0, SEEK_SET);
+        player.pos = 0;
+        continue;
+      }
+      sendJson("{\"type\":\"playEnd\"}");
+      break;
+    }
+    player.lo = loAt(player.pos);
+    Block b;
+    b.i.resize(got);
+    b.q.resize(got);
+    for (size_t j = 0; j < got; j++) {
+      b.i[j] = buf[2 * j] / 32768.0f;
+      b.q[j] = buf[2 * j + 1] / 32768.0f;
+    }
+    b.gen = rfGen.load();
+    {
+      std::lock_guard<std::mutex> lk(qMu);
+      if (queue_.size() < 200) queue_.push_back(std::move(b));
+    }
+    qCv.notify_one();
+    player.pos += got;
+    next += std::chrono::microseconds((long long)(got / player.fs * 1e6));
+    std::this_thread::sleep_until(next);
+  }
+  fclose(f);
+}
+static void stopPlayer() {
+  player.run = false;
+  if (player.th.joinable()) player.th.join();
+}
+static void iqRecFinish() {
+  if (!iqRec) return;
+  fclose(iqRec);
+  iqRec = nullptr;
+  char buf[512];
+  snprintf(buf, sizeof buf, "{\"type\":\"iqrec\",\"state\":\"stopped\",\"path\":\"%s\",\"samples\":%lld,\"fs\":%.0f,\"events\":\"%s\"}",
+           iqRecPath.c_str(), iqRecN, S.fs, iqEvents.c_str());
+  sendJson(buf);
+}
+
 // ---- main -------------------------------------------------------------------------------------------------------
 static std::mutex cmdMu;
 static std::deque<std::string> cmds;
@@ -673,7 +767,9 @@ int main() {
   uint32_t lastTune = 0;
 
   auto retune = [&](double lo) {
+    if (!streaming) return false; // (playback: the file sets the centre frequency)
     if (std::fabs(lo - ch->tunerParams.rfFreq.rfHz) < 1) return false;
+    if (iqRec) iqEvents += "," + std::to_string(iqRecN) + ":" + std::to_string((long long)lo);
     S.lo = lo;
     ch->tunerParams.rfFreq.rfHz = lo;
     int mx = lnaMax(lo);
@@ -690,10 +786,10 @@ int main() {
     auto boo = [&](const char *k, bool &v) { if (m.count(k) && m[k].t == JVal::BOOL) { v = m[k].b; return true; } return false; };
     auto str = [&](const char *k, std::string &v) { if (m.count(k) && m[k].t == JVal::STR) { v = m[k].s; return true; } return false; };
     double d;
-    if (num("fs", d) && d != S.fs) { S.fs = std::max(2e6, std::min(10e6, d)); needRestart = true; }
+    if (num("fs", d) && d != S.fs && !playing) { S.fs = std::max(2e6, std::min(10e6, d)); needRestart = true; }
     std::string t;
-    if (str("tuner", t) && (t == "A" || t == "B") && t != S.tuner) { S.tuner = t; needRestart = true; }
-    if (num("lo", d)) {
+    if (str("tuner", t) && (t == "A" || t == "B") && t != S.tuner) { S.tuner = t; if (!playing) needRestart = true; }
+    if (num("lo", d) && !playing) {
       d = std::max(1e3, std::min(2000e6, d));
       if (streaming && !needRestart) retune(d);
       else S.lo = d;
@@ -780,7 +876,63 @@ int main() {
       sw.active = false;
       retune(sw.savedLo);
       sendJson("{\"type\":\"sweep\",\"id\":\"" + sw.id + "\",\"cancelled\":true}");
-    } else if (c == "rdsReset") chain.rds.reset();
+    } else if (c == "iqRecStart" && streaming && !iqRec) {
+      iqRecPath = m["path"].s;
+      iqRecMaxSec = m.count("maxSec") ? m["maxSec"].n : 300;
+      iqRec = fopen(iqRecPath.c_str(), "wb");
+      iqRecN = 0;
+      iqEvents = "0:" + std::to_string((long long)S.lo);
+      if (!iqRec) logMsg("error", "can't write " + iqRecPath);
+      else sendJson("{\"type\":\"iqrec\",\"state\":\"started\",\"path\":\"" + iqRecPath + "\"}");
+    } else if (c == "iqRecStop") iqRecFinish();
+    else if (c == "play") {
+      iqRecFinish();
+      stopPlayer();
+      if (streaming) closeDevice();
+      {
+        std::lock_guard<std::mutex> lk(qMu);
+        queue_.clear();
+      }
+      player.path = m["path"].s;
+      player.fs = m["fs"].n;
+      player.loop = m.count("loop") && m["loop"].b;
+      player.events.clear();
+      std::string ev = m.count("events") ? m["events"].s : "";
+      for (size_t a = 0; a < ev.size();) {
+        size_t b = ev.find(',', a);
+        if (b == std::string::npos) b = ev.size();
+        std::string e = ev.substr(a, b - a);
+        size_t c2 = e.find(':');
+        if (c2 != std::string::npos) player.events.push_back({atoll(e.c_str()), atof(e.c_str() + c2 + 1)});
+        a = b + 1;
+      }
+      player.total = m.count("samples") ? (long long)m["samples"].n : 0;
+      player.pos = 0;
+      player.seekTo = (m.count("at") && m["at"].n > 0) ? (long long)(m["at"].n * player.fs) : -1;
+      player.paused = false;
+      S.fs = player.fs;
+      S.lo = loAt(0);
+      player.lo = S.lo;
+      playing = true;
+      chain.build();
+      spec.setup(S.fftN);
+      player.run = true;
+      player.th = std::thread(playerLoop);
+    } else if (c == "playStop" && playing) {
+      stopPlayer();
+      playing = false;
+      {
+        std::lock_guard<std::mutex> lk(qMu);
+        queue_.clear();
+      }
+      if (m.count("lo")) S.lo = m["lo"].n;
+      if (m.count("fs")) S.fs = m["fs"].n;
+      chain.build();
+      spec.setup(S.fftN);
+      if (!openDeviceRetry()) leave(1);
+    } else if (c == "playPause" && playing) player.paused = m.count("on") ? m["on"].b : !player.paused;
+    else if (c == "playSeek" && playing) player.seekTo = (long long)(std::max(0.0, m["sec"].n) * player.fs);
+    else if (c == "rdsReset") chain.rds.reset();
     else if (c == "quit") quit = true;
   };
 
@@ -808,6 +960,7 @@ int main() {
       todo.swap(cmds);
     }
     for (auto &l : todo) handle(l);
+    if (needRestart && playing) needRestart = false; // applies when playback stops
     if (needRestart) {
       needRestart = false;
       if (sw.active) { // a sweep can't survive the device reopening: tell the server so it can retry
@@ -879,6 +1032,18 @@ int main() {
     }
 
     // normal running: spectrum from the raw block, then the channel
+    if (playing) S.lo = player.lo;
+    if (iqRec) {
+      size_t n = blk.i.size();
+      std::vector<int16_t> w(n * 2);
+      for (size_t j = 0; j < n; j++) {
+        w[2 * j] = (int16_t)std::max(-32767.0f, std::min(32767.0f, blk.i[j] * 32768.0f));
+        w[2 * j + 1] = (int16_t)std::max(-32767.0f, std::min(32767.0f, blk.q[j] * 32768.0f));
+      }
+      fwrite(w.data(), 4, n, iqRec);
+      iqRecN += n;
+      if (iqRecN >= iqRecMaxSec * S.fs) iqRecFinish();
+    }
     if (spec.feed(blk.i.data(), blk.q.data(), blk.i.size(), S.fs, S.fps)) {
       spec.finish(specOut);
       std::vector<uint8_t> f(8 + 8 + 4 + specOut.size());
@@ -903,13 +1068,14 @@ int main() {
       double wall = std::chrono::duration<double>(now - busyT0).count();
       chain.takeLevel();
       chain.noiseCh = spec.floorDb + 10 * std::log10(chain.measBw() / (S.fs / S.fftN)) - 3.0;
-      char buf[900];
+      char buf[1200];
       snprintf(buf, sizeof buf,
                "{\"type\":\"status\",\"lo\":%.0f,\"vfo\":%.0f,\"fs\":%.0f,\"mode\":\"%s\",\"bw\":%.0f,\"level\":%.1f,"
                "\"floor\":%.1f,\"sq\":%s,\"sqOpen\":%s,\"stereo\":%s,\"pilot\":%.3f,\"lna\":%d,\"lnaMax\":%d,\"gr\":%d,"
                "\"agc\":%s,\"agcSet\":%d,\"gainGr\":%d,\"lnaGr\":%d,\"gain\":%.1f,\"overload\":%s,\"tuner\":\"%s\","
                "\"hiz\":%s,\"fmNotch\":%s,\"dabNotch\":%s,\"amNotch\":%s,\"biasT\":%s,\"ppm\":%.2f,\"fftN\":%d,"
-               "\"noise\":%.1f,\"fps\":%d,\"deemph\":%.0f,\"stereoOn\":%s,\"cwPitch\":%.0f,\"dropped\":%ld,\"load\":%.1f,\"sweeping\":%s}",
+               "\"noise\":%.1f,\"fps\":%d,\"deemph\":%.0f,\"stereoOn\":%s,\"cwPitch\":%.0f,\"dropped\":%ld,\"load\":%.1f,\"sweeping\":%s,"
+               "\"playing\":%s,\"playPos\":%.2f,\"playLen\":%.2f,\"paused\":%s,\"iqRec\":%s,\"iqRecSec\":%.1f}",
                S.lo, S.vfo, S.fs, S.mode.c_str(), S.bw, chain.level, spec.floorDb,
                S.sqOn ? std::to_string(S.sq).c_str() : "null", chain.sqOpen ? "true" : "false",
                chain.stereo() && S.mode == "wfm" ? "true" : "false", chain.pAmp, S.lna, lnaMax(S.lo), S.gr,
@@ -918,13 +1084,17 @@ int main() {
                S.dabNotch ? "true" : "false", S.amNotch ? "true" : "false", S.biasT ? "true" : "false", S.ppm, S.fftN,
                // the spectrum's noise floor (per bin) scaled to the channel: + 10 log(bw / bin) - Blackman-Harris ENBW (2 bins)
                chain.noiseCh, S.fps, S.deemph * 1e6, S.stereo ? "true" : "false", S.cwPitch, dropped.load(),
-               wall > 0 ? busy / wall * 100 : 0, sw.active ? "true" : "false");
+               wall > 0 ? busy / wall * 100 : 0, sw.active ? "true" : "false", playing ? "true" : "false",
+               playing ? player.pos / player.fs : 0.0, playing ? player.total / player.fs : 0.0, player.paused ? "true" : "false",
+               iqRec ? "true" : "false", iqRec ? iqRecN / S.fs : 0.0);
       sendJson(buf);
       lastStatus = now;
       if (wall > 2) { busy = 0; busyT0 = now; }
     }
   }
   if (deviceGone) logMsg("error", "device removed or failed");
+  iqRecFinish();
+  stopPlayer();
   closeDevice();
   if (apiOpen) sdrplay_api_Close();
   leave(deviceGone ? 3 : 0);

@@ -11,6 +11,7 @@ const http = require('http');
 const { spawn } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { Ident } = require('./ident');
+const { Decoders } = require('./decoders');
 
 const PORT = Number(process.env.PORT) || 8073;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -37,8 +38,8 @@ const DEFAULT = {
   freq: 101300000, lo: 101000000, mode: 'wfm', bw: 180000, sq: null, stereo: true, deemph: 75e-6,
   lna: 4, gr: 40, lnaAuto: true, lnaByTuner: { A: 4, B: 0 }, // lnaAuto: step the LNA state up (less gain) while the RSPduo reports overload agc: true, agcSet: -30, tuner: 'A', hiz: false, fmNotch: false, dabNotch: false, amNotch: false,
   biasT: false, ppm: 0, fs: 2400000,
-  // Auto antenna: below antSplit the MLA-30 active loop on tuner 2 (powered by the bias-T), above it the multiband
-  // antenna on tuner 1.
+  // Auto antenna: below antSplit the MLA-30 active loop on tuner 2, above it the multiband antenna on tuner 1. The
+  // loop has its own external bias injector, so the RSPduo's bias-T stays off.
   antAuto: true, antSplit: 30e6, fftN: 4096, fps: 20, cwPitch: 700, step: 100000, fmGrid: 'na',
   modeBw: {}, // remembered bandwidth per mode
   modeSq: {}, // remembered squelch per mode
@@ -54,6 +55,131 @@ let fm = readJson('fm.json', { stations: [], scanned: 0 }); // stations: [{freq,
 let lastSearch = readJson('search.json', null);
 let hits = readJson('hits.json', []); // scanner log
 const ident = new Ident(DATA_DIR);
+const HOME = { lat: Number(process.env.HOME_LAT) || 44.65, lon: Number(process.env.HOME_LON) || -63.83 };
+// ---- recordings: audio (WAV, what you hear) and IQ (the whole captured span, replayable) ---------------------------
+const REC_DIR = path.join(DATA_DIR, 'recordings');
+fs.mkdirSync(REC_DIR, { recursive: true });
+const recs = {
+  audio: null, // {fd, file, ch, samples, meta}
+  iq: null, // {file, meta} while the engine records
+  list() {
+    const out = [];
+    for (const f of fs.readdirSync(REC_DIR)) {
+      if (!f.endsWith('.json')) continue;
+      try {
+        const m = JSON.parse(fs.readFileSync(path.join(REC_DIR, f), 'utf8'));
+        const st = fs.statSync(path.join(REC_DIR, m.file));
+        out.push({ ...m, size: st.size });
+      } catch (e) {}
+    }
+    return out.sort((a, b) => b.t - a.t);
+  },
+  free() {
+    try {
+      const st = fs.statfsSync(REC_DIR);
+      return st.bavail * st.bsize;
+    } catch (e) {
+      return Infinity;
+    }
+  },
+  name(kind) {
+    const d = new Date(), p2 = (n) => String(n).padStart(2, '0');
+    return `${kind}-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}-${(state.freq / 1e6).toFixed(4)}MHz-${state.mode}`;
+  },
+  meta(kind, file) {
+    return { kind, file, t: Date.now(), freq: state.freq, mode: state.mode, bw: state.bw, lo: state.lo, fs: state.fs, ps: rds?.freq === state.freq ? (rds.ps || '').trim() : '', band: '' };
+  },
+  startAudio() {
+    if (this.audio) return;
+    if (this.free() < 1e9) throw new Error('less than 1 GB free on the Pi');
+    const base = this.name('audio'), file = base + '.wav';
+    const fd = fs.openSync(path.join(REC_DIR, file), 'w');
+    fs.writeSync(fd, Buffer.alloc(44)); // header written on stop
+    this.audio = { fd, file, base, samples: 0, meta: this.meta('audio', file) };
+    updateAudioFlag();
+  },
+  feedAudio(pcm, ch) {
+    const a = this.audio;
+    if (!a) return;
+    // always stereo in the file (mono modes duplicated)
+    const n = pcm.length / ch, out = Buffer.alloc(n * 4);
+    for (let i = 0; i < n; i++) {
+      out.writeInt16LE(pcm[i * ch], i * 4);
+      out.writeInt16LE(pcm[i * ch + (ch - 1)], i * 4 + 2);
+    }
+    fs.writeSync(a.fd, out);
+    a.samples += n;
+  },
+  stopAudio() {
+    const a = this.audio;
+    if (!a) return null;
+    this.audio = null;
+    const h = Buffer.alloc(44), bytes = a.samples * 4;
+    h.write('RIFF', 0); h.writeUInt32LE(36 + bytes, 4); h.write('WAVEfmt ', 8); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(2, 22);
+    h.writeUInt32LE(48000, 24); h.writeUInt32LE(48000 * 4, 28); h.writeUInt16LE(4, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(bytes, 40);
+    fs.writeSync(a.fd, h, 0, 44, 0);
+    fs.closeSync(a.fd);
+    const meta = { ...a.meta, dur: a.samples / 48000 };
+    fs.writeFileSync(path.join(REC_DIR, a.base + '.json'), JSON.stringify(meta));
+    updateAudioFlag();
+    return meta;
+  },
+  startIq(maxSec) {
+    if (this.iq || playback) return;
+    const sec = Math.max(5, Math.min(3600, Number(maxSec) || 300));
+    const need = sec * state.fs * 4;
+    if (this.free() < need + 2e9) throw new Error(`not enough space for ${sec} s (${(need / 1e9).toFixed(1)} GB needed)`);
+    const base = this.name('iq'), file = base + '.iq';
+    this.iq = { base, file, meta: this.meta('iq', file) };
+    send({ cmd: 'iqRecStart', path: path.join(REC_DIR, file), maxSec: sec });
+  },
+  stopIq() {
+    if (this.iq) send({ cmd: 'iqRecStop' });
+  },
+  onEngine(j) {
+    // engine finished an IQ recording (stopped by us, by the length limit, or by playback starting)
+    if (j.state !== 'stopped' || !this.iq) return;
+    const meta = { ...this.iq.meta, samples: j.samples, fs: j.fs, events: j.events, dur: j.samples / j.fs };
+    fs.writeFileSync(path.join(REC_DIR, this.iq.base + '.json'), JSON.stringify(meta));
+    this.iq = null;
+    broadcastJson({ type: 'recordings', list: this.list() });
+    broadcastState();
+  },
+  remove(file) {
+    if (!/^[\w.-]+$/.test(file) || this.audio?.file === file || this.iq?.file === file || playback?.file === file) return false;
+    const base = file.replace(/\.(wav|iq)$/, '');
+    for (const f of [file, base + '.json']) fs.rmSync(path.join(REC_DIR, f), { force: true });
+    return true;
+  },
+};
+// IQ playback: the engine reads a recording instead of the RSPduo; tuning moves only the listening point inside it.
+let playback = null; // {file, meta, saved: {lo, fs, freq}}
+function startPlayback(file, at) {
+  const meta = recs.list().find((r) => r.file === file && r.kind === 'iq');
+  if (!meta) throw new Error('no such IQ recording');
+  scanner.stop();
+  if (playback) send({ cmd: 'playStop' });
+  const saved = playback?.saved || { lo: state.lo, fs: state.fs, freq: state.freq };
+  playback = { file, meta, saved };
+  state.lo = Number(String(meta.events || '').split(',')[0].split(':')[1]) || meta.lo;
+  state.fs = meta.fs;
+  send({ cmd: 'play', path: path.join(REC_DIR, file), fs: meta.fs, events: meta.events || `0:${meta.lo}`, samples: meta.samples, at: at || 0, loop: false });
+  if (meta.mode && meta.mode !== state.mode) setMode(meta.mode, meta.bw);
+  tune(meta.freq);
+  broadcastState();
+}
+function stopPlayback() {
+  if (!playback) return;
+  const { saved } = playback;
+  playback = null;
+  state.lo = saved.lo;
+  state.fs = saved.fs;
+  send({ cmd: 'playStop', lo: saved.lo, fs: saved.fs });
+  tune(saved.freq);
+  broadcastState();
+}
+
+const decoders = new Decoders({ log: (...a) => log(...a), emit: (o) => broadcastJson(o), freq: () => state.freq, home: HOME, dataDir: DATA_DIR });
 let identTimer = null;
 function sendIdent(target) {
   const items = ident.lookup(state.freq, state.mode).slice(0, 12);
@@ -73,7 +199,7 @@ function engineSettings() {
     cmd: 'set', lo: s.lo, vfo: s.freq - s.lo, mode: s.mode, bw: s.bw, sq: s.sq, stereo: s.stereo, deemph: s.deemph,
     lna: s.lna, gr: s.gr, agc: s.agc, agcSet: s.agcSet, tuner: s.tuner, hiz: s.hiz, fmNotch: s.fmNotch,
     dabNotch: s.dabNotch, amNotch: s.amNotch, biasT: s.biasT, ppm: s.ppm, fs: s.fs, fftN: s.fftN, fps: s.fps,
-    cwPitch: s.cwPitch, audio: listeners() > 0,
+    cwPitch: s.cwPitch, audio: listeners() > 0 || decoders.mode !== 'off',
   };
 }
 function send(obj) {
@@ -131,6 +257,10 @@ function onJson(text) {
     rds = { ...j, freq: state.freq, t: Date.now() };
     fmIdent.onRds(rds);
     j = rds;
+  } else if (j.type === 'iqrec') {
+    recs.onEngine(j);
+  } else if (j.type === 'playEnd') {
+    stopPlayback();
   } else if (j.type === 'device') {
     device = j;
     deviceReady();
@@ -159,6 +289,12 @@ function onSpectrum(p) {
   for (const c of clients) if (c.ws.readyState === 1 && c.ws.bufferedAmount < 2e6 && !c.noSpectrum) c.ws.send(out);
 }
 function onAudio(p) {
+  if (recs.audio || decoders.mode !== 'off') {
+    const b = Buffer.from(p.subarray(4)); // a copy: Int16Array needs an aligned offset
+    const pcm = new Int16Array(b.buffer, b.byteOffset, b.length >> 1);
+    if (recs.audio) recs.feedAudio(pcm, p[0]);
+    if (decoders.mode !== 'off') decoders.feed(pcm, p[0]);
+  }
   const out = Buffer.allocUnsafe(1 + p.length);
   out[0] = 2;
   p.copy(out, 1);
@@ -211,7 +347,7 @@ function autoLna(s) {
   log('overload: LNA state ->', s.lna + 1);
 }
 function antennaFor(freq) {
-  return freq < state.antSplit ? { tuner: 'B', biasT: true, hiz: false } : { tuner: 'A', biasT: false, hiz: false };
+  return freq < state.antSplit ? { tuner: 'B', biasT: false, hiz: false } : { tuner: 'A', biasT: false, hiz: false };
 }
 function pickAntenna(freq) {
   if (!state.antAuto) return;
@@ -225,6 +361,16 @@ function pickAntenna(freq) {
 // sits a quarter span above the centre.
 function tune(freq, opts = {}) {
   freq = Math.round(Math.max(1000, Math.min(2000e6, freq)));
+  if (playback) {
+    // inside the recorded span only; the centre frequency comes from the file
+    const half = state.fs * 0.45;
+    freq = Math.round(Math.max(state.lo - half, Math.min(state.lo + half, freq)));
+    state.freq = freq;
+    send({ cmd: 'set', vfo: state.freq - state.lo });
+    saveState();
+    broadcastState();
+    return;
+  }
   pickAntenna(freq);
   const half = state.fs / 2, margin = Math.max(state.bw, 20000);
   const off = freq - state.lo;
@@ -294,14 +440,16 @@ function broadcastJson(o) {
 function publicState() {
   return {
     type: 'state', state, device, engine: engineUp, clients: clients.size, listeners: listeners(), rds,
-    scan: scanner.info(), fmScan: fmIdent.info(), memories, fm, lastSearch: lastSearch && { ...lastSearch, spectrum: undefined },
+    scan: scanner.info(), fmScan: fmIdent.info(), decoder: decoders.info(), survey: hamSurvey.result,
+    rec: { audio: recs.audio ? { file: recs.audio.file, t: recs.audio.meta.t } : null, iq: recs.iq ? { file: recs.iq.file, t: recs.iq.meta.t } : null },
+    playback: playback && { file: playback.file, meta: playback.meta }, memories, fm, lastSearch: lastSearch && { ...lastSearch, spectrum: undefined },
   };
 }
 function broadcastState() {
   broadcastJson(publicState());
 }
 function updateAudioFlag() {
-  send({ cmd: 'set', audio: listeners() > 0 });
+  send({ cmd: 'set', audio: listeners() > 0 || decoders.mode !== 'off' || !!recs.audio });
 }
 
 async function onClientMessage(c, msg) {
@@ -394,6 +542,72 @@ async function onClientMessage(c, msg) {
         break;
       case 'scanResume':
         scanner.resume();
+        break;
+      case 'decoderStart': {
+        const mode = m.mode;
+        scanner.stop();
+        if (mode === 'ft8' || mode === 'ft4') {
+          setMode('usb', 3000);
+          setRadio({ sq: null });
+          if (m.dial) tune(Number(m.dial));
+        } else if (mode === 'cw') {
+          if (state.mode !== 'cw') setMode('cw', 500);
+          setRadio({ sq: null });
+        } else if (mode === 'aprs') {
+          setMode('nfm', 12500);
+          tune(Number(m.dial) || 144390000);
+        }
+        decoders.start(mode);
+        updateAudioFlag();
+        broadcastState();
+        break;
+      }
+      case 'decoderStop':
+        decoders.stop();
+        updateAudioFlag();
+        broadcastState();
+        break;
+      case 'decodeHistory':
+        reply({ type: 'decodeHistory', history: decoders.history });
+        break;
+      case 'hamSurvey':
+        hamSurvey.run(m).catch((e) => reply({ type: 'toast', msg: 'Survey: ' + e.message, error: true }));
+        break;
+      case 'scanHold':
+        scanner.hold();
+        break;
+      case 'recStart':
+        if (m.kind === 'iq') recs.startIq(m.maxSec);
+        else recs.startAudio();
+        broadcastState();
+        break;
+      case 'recStop':
+        if (m.kind === 'iq') recs.stopIq();
+        else {
+          const meta = recs.stopAudio();
+          if (meta) reply({ type: 'toast', msg: `Saved ${meta.dur.toFixed(0)} s of audio on the Pi (Recordings tab)` });
+          broadcastJson({ type: 'recordings', list: recs.list() });
+        }
+        broadcastState();
+        break;
+      case 'recList':
+        reply({ type: 'recordings', list: recs.list(), free: recs.free() });
+        break;
+      case 'recDelete':
+        if (!recs.remove(String(m.file))) reply({ type: 'toast', msg: "Can't delete that one now", error: true });
+        broadcastJson({ type: 'recordings', list: recs.list() });
+        break;
+      case 'playStart':
+        startPlayback(String(m.file), Number(m.at) || 0);
+        break;
+      case 'playStop':
+        stopPlayback();
+        break;
+      case 'playPause':
+        send({ cmd: 'playPause', on: m.on });
+        break;
+      case 'playSeek':
+        send({ cmd: 'playSeek', sec: Number(m.sec) || 0 });
         break;
       case 'lockoutsClear':
         scanner.lockouts.clear();
@@ -488,6 +702,7 @@ function findPeaks(sw, start, stop, step, thr) {
 }
 async function runSearch(m) {
   if (searching) throw new Error('a search is already running');
+  if (playback) throw new Error('stop the IQ playback first');
   const start = Math.max(1000, Number(m.start)), stop = Math.min(2000e6, Number(m.stop));
   if (!(stop > start)) throw new Error('bad range');
   const step = Math.max(100, Number(m.step) || 12500), thr = Number(m.threshold) || 10;
@@ -547,6 +762,7 @@ const scanner = {
       mode: m.mode || state.mode, bw: Number(m.bw) || 0, group: m.group || null, threshold: Number(m.threshold) || 10,
       dwell: Math.max(80, Number(m.dwell) || 150), hang: Math.max(0, Number(m.hang ?? 2000)), sq: m.sq ?? null,
       maxListen: Number(m.maxListen) || 0,
+      onHit: m.onHit === 'lock' ? 'lock' : 'resume', // lock: stay on the signal until Resume
     };
     let list = [];
     if (cfg.source === 'memories') list = memories.filter((x) => !x.lockout && (!cfg.group || x.group === cfg.group)).map((x) => ({ ...x }));
@@ -578,10 +794,16 @@ const scanner = {
     if (this.on) this.stop();
   },
   resume() {
-    if (this.on && this.paused) {
+    if (this.on && (this.paused || this.phase === 'locked')) {
       this.paused = false;
       this.next();
     }
+  },
+  hold() {
+    if (!this.on) return;
+    clearTimeout(this.timer);
+    this.phase = 'locked';
+    broadcastJson({ type: 'scan', scan: this.info() });
   },
   skip(lockout) {
     if (!this.on) return;
@@ -639,7 +861,7 @@ const scanner = {
     return (status.level ?? -200) > sq;
   },
   listen() {
-    this.phase = 'listen';
+    this.phase = this.cfg.onHit === 'lock' ? 'locked' : 'listen';
     this.since = Date.now();
     this.lastOpen = Date.now();
     const ch = this.list[this.idx];
@@ -652,13 +874,43 @@ const scanner = {
   },
   onStatus(s) {
     if (!this.on || this.paused) return;
-    if (this.phase === 'listen') {
+    if (this.phase === 'listen') { // ('locked' stays put until Resume or Skip)
       if (this.open()) this.lastOpen = Date.now();
       const tooLong = this.cfg.maxListen && Date.now() - this.since > this.cfg.maxListen;
       if (Date.now() - this.lastOpen > this.cfg.hang || tooLong) this.next();
     }
   },
   onSpectrum() {},
+};
+
+// ---- ham band survey: how busy is each HF band right now ----------------------------------------------------------
+const HAM_HF = [['160 m', 1.8e6, 2.0e6], ['80 m', 3.5e6, 4.0e6], ['60 m', 5.3305e6, 5.4065e6], ['40 m', 7.0e6, 7.3e6], ['30 m', 10.1e6, 10.15e6], ['20 m', 14.0e6, 14.35e6],
+  ['17 m', 18.068e6, 18.168e6], ['15 m', 21.0e6, 21.45e6], ['12 m', 24.89e6, 24.99e6], ['10 m', 28.0e6, 29.7e6], ['6 m', 50.0e6, 54.0e6]];
+const hamSurvey = {
+  running: false, result: readJson('survey.json', null),
+  async run(m) {
+    if (this.running) throw new Error('already running');
+    if (playback) throw new Error('stop the IQ playback first');
+    this.running = true;
+    scanner.stop();
+    const saved = state.freq, t0 = Date.now(), bands = [];
+    try {
+      for (const [name, a, b] of HAM_HF) {
+        if (m.hfOnly && a > 30e6) continue;
+        pickAntenna((a + b) / 2);
+        broadcastJson({ type: 'hamSurvey', running: true, band: name });
+        const sw = await sweep(a, b, 250);
+        const { floor, channels } = findPeaks(sw, a, b, 1000, Number(m.threshold) || 8);
+        bands.push({ name, start: a, stop: b, count: channels.length, floor: Math.round(floor), top: channels.sort((x, y) => y.snr - x.snr).slice(0, 12) });
+      }
+      this.result = { t: Date.now(), took: Date.now() - t0, bands };
+      writeJson('survey.json', this.result);
+      broadcastJson({ type: 'hamSurvey', running: false, result: this.result });
+    } finally {
+      this.running = false;
+      tune(saved);
+    }
+  },
 };
 
 // ---- FM broadcast: sweep, snap to the grid, identify by RDS ---------------------------------------------------------
@@ -669,6 +921,7 @@ const fmIdent = {
   },
   async start(m) {
     if (this.running) throw new Error('already scanning');
+    if (playback) throw new Error('stop the IQ playback first');
     this.running = true;
     this.cancel = false;
     scanner.stop();
@@ -791,6 +1044,29 @@ const server = http.createServer((req, res) => {
   if (p === '/api/fm') return json(fm);
   if (p === '/api/search') return json(lastSearch);
   if (p === '/api/hits') return json(hits);
+  if (p === '/api/recordings') return json({ list: recs.list(), free: recs.free() });
+  const rm = /^\/rec\/([\w.-]+\.(wav|iq))$/.exec(p);
+  if (rm) {
+    // recordings, with Range support so the browser's audio player can seek
+    const f = path.join(REC_DIR, rm[1]);
+    let st;
+    try {
+      st = fs.statSync(f);
+    } catch (e) {
+      res.writeHead(404);
+      return res.end();
+    }
+    const type = rm[2] === 'wav' ? 'audio/wav' : 'application/octet-stream';
+    const range = /bytes=(\d*)-(\d*)/.exec(req.headers.range || '');
+    const headers = { 'Content-Type': type, 'Accept-Ranges': 'bytes', ...(url.searchParams.has('dl') ? { 'Content-Disposition': `attachment; filename="${rm[1]}"` } : {}) };
+    if (range) {
+      const a = range[1] ? Number(range[1]) : 0, b = range[2] ? Math.min(Number(range[2]), st.size - 1) : st.size - 1;
+      res.writeHead(206, { ...headers, 'Content-Range': `bytes ${a}-${b}/${st.size}`, 'Content-Length': b - a + 1 });
+      return fs.createReadStream(f, { start: a, end: b }).pipe(res);
+    }
+    res.writeHead(200, { ...headers, 'Content-Length': st.size });
+    return fs.createReadStream(f).pipe(res);
+  }
   if (p === '/api/ident') return json({ freq: Number(url.searchParams.get('f')) || state.freq, items: ident.lookup(Number(url.searchParams.get('f')) || state.freq), info: ident.info() });
   if (p === '/api/onair') {
     const a = Number(url.searchParams.get('start')) || 0, b = Number(url.searchParams.get('end')) || 30e6;
@@ -855,6 +1131,7 @@ wss.on('connection', (ws, req) => {
   ws.send(JSON.stringify(publicState()));
   if (status.type) ws.send(JSON.stringify(status));
   ws.send(JSON.stringify({ type: 'hits', hits: hits.slice(0, 100) }));
+  ws.send(JSON.stringify({ type: 'decodeHistory', history: decoders.history }));
   sendIdent(ws);
   ws.on('message', (data, isBinary) => {
     if (!isBinary) onClientMessage(c, data.toString());

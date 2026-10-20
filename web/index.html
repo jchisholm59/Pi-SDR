@@ -14,6 +14,7 @@
     <span id="conn" class="pill bad">connecting…</span>
     <span id="ant" class="pill" title="Antenna in use"></span>
     <span id="ovl" class="pill bad" hidden>OVERLOAD</span>
+    <span id="recPill" class="pill bad" hidden>● REC</span>
     <span id="load" class="pill dim" title="Engine DSP load (one core)"></span>
     <span id="who" class="pill dim" title="Browsers connected / listening"></span>
   </div>
@@ -44,7 +45,7 @@
       <button id="listen" class="big">▶ Listen</button>
       <label class="vol" title="Volume">🔊 <input id="vol" type="range" min="0" max="1.5" step="0.01" value="0.8"></label>
       <button id="mute" class="ic" title="Mute">🔇</button>
-      <button id="rec" class="ic" title="Record audio to a WAV file">⏺</button>
+      <button id="rec" class="ic" title="Record what you hear, on the Pi (Recordings tab)">⏺</button>
       <label class="sq" title="Squelch: audio opens when the channel level is this far above its noise (Off = always open)">SQL <input id="sq" type="range" min="0" max="40" step="1" value="0"><span id="sqLbl">off</span></label>
     </div>
   </section>
@@ -53,6 +54,12 @@
     <div class="ps" id="rdsPs"></div>
     <div class="rdsmid"><div class="rt" id="rdsRt"></div><div class="rdsmeta" id="rdsMeta"></div></div>
     <button id="favNow" class="star" title="Add this station to the FM favourites">☆</button>
+  </section>
+
+  <section class="playbar" id="playbar" hidden>
+    <b>▶ IQ PLAYBACK</b><span id="playName" class="grow"></span>
+    <button id="playPause" class="ic">⏸</button><button id="playStop">■ Back to live</button>
+    <input type="range" id="playPos" min="0" max="1000" value="0" class="grow"><span id="playTime" class="mono"></span>
   </section>
 
   <section class="specwrap">
@@ -86,11 +93,13 @@
   <section class="panel">
     <nav class="tabs" id="tabs">
       <button data-tab="fm">FM radio</button>
+      <button data-tab="ham">Ham</button>
       <button data-tab="onair">On air</button>
       <button data-tab="bands">Bands</button>
       <button data-tab="mem">Memories</button>
       <button data-tab="scan">Scanner</button>
       <button data-tab="radio">Radio</button>
+      <button data-tab="rec">Recordings</button>
       <button data-tab="log">Log</button>
     </nav>
 
@@ -103,6 +112,29 @@
       </div>
       <div class="stations" id="fmList"></div>
       <div class="rdsfull" id="rdsFull"></div>
+    </div>
+
+    <div class="tab" data-tab="ham">
+      <div class="cols">
+        <div class="card">
+          <h3>Amateur bands <span class="muted">tap a segment to tune it; 🔒 auto-scans it and locks on the first signal</span></h3>
+          <div id="hamBands" class="hambands"></div>
+        </div>
+        <div class="card">
+          <h3>Decoder <span class="muted" id="decState">off</span></h3>
+          <div class="row">
+            <span class="seg" id="decModes"><button data-dec="ft8">FT8</button><button data-dec="ft4">FT4</button><button data-dec="cw">CW</button><button data-dec="aprs">APRS</button><button data-dec="off">Off</button></span>
+            <label id="decDialL">Dial <select id="decDial"></select></label>
+          </div>
+          <div class="muted small" id="decHelp"></div>
+          <div id="decOut" class="decout"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <h3>HF band survey <span class="muted">sweeps 160 – 6 m and counts the signals on each band (about 15 s)</span></h3>
+        <div class="row"><button id="surveyGo" class="pri">Survey the bands</button><span class="muted" id="surveyInfo"></span></div>
+        <div id="survey" class="survey"></div>
+      </div>
     </div>
 
     <div class="tab" data-tab="onair">
@@ -168,9 +200,11 @@
             <label title="Time on each channel">Dwell <input id="cDwell" type="number" value="150" min="80" step="10" style="width:5em"> ms</label>
             <label title="Keep listening this long after the signal drops">Hang <input id="cHang" type="number" value="2" min="0" step="0.5" style="width:4em"> s</label>
             <label title="Move on after this long even if it's still busy (0 = never)">Max <input id="cMax" type="number" value="0" min="0" style="width:4em"> s</label>
+            <label title="What to do when a signal is found">On a signal <select id="cOnHit"><option value="resume">listen, then move on</option><option value="lock">lock on it</option></select></label>
           </div>
           <div class="row">
             <button id="cGo" class="pri">Start scanning</button><button id="cStop2">Stop</button>
+            <button id="cHold" title="Stay on this channel">🔒 Hold</button><button id="cResume" title="Carry on scanning">Resume</button>
             <button id="cSkip">Skip</button><button id="cLock" title="Skip this frequency for the rest of the session">Lock out</button>
             <button id="cSave" title="Save the current frequency to memories">Save</button>
             <button id="cClearLock" title="Forget all lock-outs">Clear lock-outs</button>
@@ -184,10 +218,10 @@
       <div class="cols">
         <div class="card">
           <h3>Antenna</h3>
-          <div class="row"><label><input type="radio" name="ant" value="auto"> <b>Auto</b>: MLA-30 loop (tuner 2, bias-T on) below <input id="antSplit" type="number" value="30" min="1" max="200" style="width:4em"> MHz, multiband (tuner 1) above</label></div>
+          <div class="row"><label><input type="radio" name="ant" value="auto"> <b>Auto</b>: MLA-30 loop (tuner 2) below <input id="antSplit" type="number" value="30" min="1" max="200" style="width:4em"> MHz, multiband (tuner 1) above</label></div>
           <div class="row"><label><input type="radio" name="ant" value="A"> Tuner 1 (multiband), 50 Ω</label></div>
           <div class="row"><label><input type="radio" name="ant" value="AH"> Tuner 1, Hi-Z port</label></div>
-          <div class="row"><label><input type="radio" name="ant" value="B"> Tuner 2 (loop), 50 Ω</label><label><input type="checkbox" id="biasT"> Bias-T (powers the loop)</label></div>
+          <div class="row"><label><input type="radio" name="ant" value="B"> Tuner 2 (loop), 50 Ω</label><label title="The loop has its own external injector: leave this off"><input type="checkbox" id="biasT"> RSPduo bias-T (off: the loop has an external injector)</label></div>
           <h3>Filters</h3>
           <div class="row"><label><input type="checkbox" id="fmNotch"> FM broadcast notch</label><label><input type="checkbox" id="dabNotch"> DAB notch</label><label><input type="checkbox" id="amNotch"> MW notch (Hi-Z)</label></div>
         </div>
@@ -211,6 +245,17 @@
           <div class="muted" id="engInfo"></div>
         </div>
       </div>
+    </div>
+
+    <div class="tab" data-tab="rec">
+      <div class="row">
+        <button id="recAudio" class="pri">⏺ Record audio</button>
+        <button id="recIq" class="pri" title="Records the whole captured span: replay it later and tune anything inside it">⏺ Record IQ (spectrum)</button>
+        <label>IQ limit <input id="recIqMax" type="number" value="5" min="0.1" max="60" step="0.5" style="width:4.5em"> min</label>
+        <span class="muted" id="recInfo"></span>
+      </div>
+      <p class="muted small">Audio recordings are what you hear (WAV, 48 kHz stereo). IQ recordings hold the whole captured span (2.4 MHz ≈ 0.6 GB a minute): Play loads one into the radio, and you can tune and demodulate anything inside it, with spectrum, waterfall, RDS and decoders working as live.</p>
+      <div id="recList" class="results" style="max-height:520px"></div>
     </div>
 
     <div class="tab" data-tab="log">

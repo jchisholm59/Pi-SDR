@@ -155,3 +155,33 @@ td .act button { padding: 2px 8px; font-size: .85em; }
 .identline b { color: #a5d6a7; font-weight: 600; }
 .onair { color: var(--good); font-weight: 700; font-size: .8em; }
 .offair { color: #4a5b6b; font-size: .8em; }
+
+.hambands { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 8px; }
+.hb { background: #0e151d; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; }
+.hb.cur { border-color: var(--acc2); }
+.hb .t { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
+.hb .t b { font-size: 1.05em; }
+.hb .t span { color: var(--muted); font-family: var(--mono); font-size: .75em; }
+.hb .b { display: flex; flex-wrap: wrap; gap: 4px; }
+.hb .b button { padding: 2px 8px; font-size: .8em; }
+.hb .b button.lock { border-color: #5a4a18; }
+.hb .c { margin-top: 4px; font-size: .75em; color: var(--muted); }
+.hb .c a { color: #9fc6e0; cursor: pointer; margin-right: 8px; text-decoration: none; }
+.decout { max-height: 460px; overflow: auto; margin-top: 6px; }
+.decout table td { font-size: .92em; }
+.decout .cq td { color: #a5d6a7; }
+.decout .me td { color: var(--acc2); }
+.cwtext { font-family: var(--mono); font-size: 1.15em; line-height: 1.5; white-space: pre-wrap; word-break: break-word; background: #0a1118; border-radius: 6px; padding: 10px; min-height: 8em; }
+.survey { display: grid; gap: 4px; }
+.survey .sb { display: grid; grid-template-columns: 4.5em 1fr 3em; gap: 8px; align-items: center; cursor: pointer; }
+.survey .sb i { display: block; height: 14px; background: linear-gradient(90deg, #2e7d32, #9ccc65); border-radius: 3px; }
+.survey .sb small { color: var(--muted); font-family: var(--mono); }
+.survey .tops { grid-column: 2 / 4; font-size: .78em; color: var(--muted); }
+.survey .tops a { color: #9fc6e0; margin-right: 8px; cursor: pointer; }
+
+.playbar { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; background: #2a1f08; border: 1px solid #6d5414; border-radius: 12px; padding: 8px 14px; }
+.playbar b { color: var(--acc2); letter-spacing: .05em; }
+.playbar #playPos { min-width: 200px; }
+.reckind { font-size: .75em; font-weight: 700; padding: 1px 6px; border-radius: 4px; background: #1d3343; color: var(--acc); }
+.reckind.iq { background: #3a2a10; color: var(--acc2); }
+.recrow audio { height: 30px; vertical-align: middle; width: 260px; }
