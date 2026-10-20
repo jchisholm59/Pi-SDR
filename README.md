@@ -39,6 +39,22 @@ and the radio, the spectrum and the audio come to you. Covers everything the RSP
   attenuation when the RSPduo reports overload.
 - Any number of browsers at once (they share the one radio). Phone friendly.
 
+## Screenshots
+
+**On air**: the station identifier on the 31 m band, using the loop on tuner 2. On-air stations are labelled on the
+spectrum, the line under the frequency says what's on it now, and the tab lists everything scheduled there and every
+broadcast on air in the band.
+
+![On air tab: 9580 kHz, KNLS on air, the 31 m band's on-air list and labels on the spectrum](docs/onair.png)
+
+**Scanner**: a 2.4-second air-band search with its sweep plot and results (listen, save, scan them), and the scanner.
+
+![Scanner tab: air band search results and the scanner settings](docs/scanner.png)
+
+**Radio**: antenna (auto loop / multiband), gain and receiver settings.
+
+![Radio tab: antenna, gain and receiver settings](docs/radio.png)
+
 ## How it's built
 
 ```

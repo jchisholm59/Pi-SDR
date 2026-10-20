@@ -758,9 +758,9 @@ function draw(full) {
     items.sort((a, b) => a.f - b.f);
     for (const it of items) {
       if (it.f < view.start || it.f > view.end || !it.t) continue;
-      const x = fToX(it.f);
-      if (x - lastX < 60 * dpr) continue;
-      lastX = x;
+      const x = fToX(it.f), w = g.measureText(it.t.trim()).width;
+      if (x - w / 2 < lastX + 8 * dpr) continue; // lastX: right edge of the previous label
+      lastX = x + w / 2;
       g.fillStyle = it.c;
       g.fillText(it.t.trim(), x, 14 * dpr);
       g.fillRect(x - 0.5, 18 * dpr, 1, 6 * dpr);
@@ -769,9 +769,9 @@ function draw(full) {
     lastX = -1e9;
     for (const it of labelItems) {
       if (it.hz < view.start || it.hz > view.end || it.onAir === false) continue;
-      const x = fToX(it.hz);
-      if (x - lastX < 70 * dpr) continue;
-      lastX = x;
+      const x = fToX(it.hz), w = g.measureText(it.name.slice(0, 18)).width;
+      if (x - w / 2 < lastX + 8 * dpr) continue;
+      lastX = x + w / 2;
       g.fillStyle = it.source === 'eibi' ? '#a5d6a7' : '#ce93d8';
       g.fillText(it.name.slice(0, 18), x, 30 * dpr);
       g.fillRect(x - 0.5, 33 * dpr, 1, 5 * dpr);
