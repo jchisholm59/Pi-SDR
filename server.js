@@ -283,6 +283,7 @@ function onJson(text) {
 function onSpectrum(p) {
   lastSpectrum = { lo: p.readDoubleLE(0), fs: p.readDoubleLE(8), n: p.readUInt32LE(16), db: new Int8Array(p.buffer, p.byteOffset + 20, p.readUInt32LE(16)).slice() };
   scanner.onSpectrum(lastSpectrum);
+  watch.onSpectrum(lastSpectrum);
   const out = Buffer.allocUnsafe(1 + p.length);
   out[0] = 1;
   p.copy(out, 1);
@@ -465,11 +466,20 @@ async function onClientMessage(c, msg) {
       case 'tune':
         if (!m.keepScan) scanner.pauseForUser();
         tune(m.freq, m);
+        watch.userTuned(m.freq);
+        break;
+      case 'watchStart':
+      case 'watchStop':
+      case 'watchScan':
+      case 'watchLock':
+      case 'watchTune':
+        await watch.command(c, m);
         break;
       case 'mode':
         setMode(m.mode, m.bw);
         break;
       case 'set':
+        if ('sq' in m) watch.sqSet = false; // the listener's own squelch now: kept when the watch ends
         setRadio(m);
         break;
       case 'audio':
@@ -532,6 +542,7 @@ async function onClientMessage(c, msg) {
         send({ cmd: 'sweepCancel' });
         break;
       case 'scanStart':
+        watch.stop(false);
         scanner.start(m);
         break;
       case 'scanStop':
@@ -710,6 +721,7 @@ async function runSearch(m) {
   const binHz = Math.max(native, Math.min(step / 2, (stop - start) / 40000));
   searching = true;
   scanner.stop();
+  watch.stop(false);
   broadcastJson({ type: 'search', running: true, start, stop });
   try {
     const t0 = Date.now();
@@ -881,6 +893,143 @@ const scanner = {
     }
   },
   onSpectrum() {},
+};
+
+// ---- watch: a few channels inside one span, all at once (the Planes / Ships cards' Listen panel) ------------------
+// Every spectrum frame (20/s) gives each channel's level, so all of them light up within ~0.1 s of a transmission,
+// with no retuning. The span is chosen to hold them all (the RSPduo's IF filter: 1.536 MHz at 2.4 MS/s, 5 MHz at 6,
+// 7 MHz at 8). Scan: the receiver follows the first active channel (list order = priority) and stays HANG ms after it
+// goes quiet. Threshold = the squelch (dB above the noise), so one slider sets both. The client that started it owns
+// it: when it stops or disconnects, the receiver goes back to how it was.
+const WATCH_FS = [[2.4e6, 1.536e6], [6e6, 5e6], [8e6, 7e6]];
+const SQ_DEFAULT = { am: 6, nfm: 4 }; // when the mode has no squelch of its own
+const LIGHT_MIN_DB = 6; // channel lights: at least this far over the channel's own noise
+const watch = {
+  on: false, owner: null, list: [], mode: 'am', scan: true, locked: false, cur: -1, hang: 2000, saved: null, sqSet: false, lo: 0,
+  info() {
+    return { type: 'watch', on: this.on, scan: this.scan, locked: this.locked, cur: this.cur, mode: this.mode,
+      ch: this.list.map((c) => ({ name: c.name, freq: c.freq, active: c.active, scan: c.scan })) };
+  },
+  send() {
+    broadcastJson(this.info());
+  },
+  async start(c, m) {
+    const list = (Array.isArray(m.channels) ? m.channels : []).map((x) => ({ name: String(x.name || x.freq).slice(0, 30), freq: Math.round(Number(x.freq)), scan: x.scan !== false }))
+      .filter((x) => x.freq > 1e6).slice(0, 24);
+    if (!list.length) return;
+    if (playback) return broadcastJson({ type: 'toast', msg: 'Stop the IQ playback first', error: true });
+    scanner.stop();
+    const mode = MODE_BW[m.mode] ? m.mode : 'am';
+    const lo = Math.min(...list.map((x) => x.freq)), hi = Math.max(...list.map((x) => x.freq)), half = MODE_BW[mode];
+    const fsPick = WATCH_FS.find(([, bw]) => hi - lo + 2 * half + 60e3 < bw * 0.9);
+    if (!fsPick) return broadcastJson({ type: 'toast', msg: `Listen: channels span ${((hi - lo) / 1e6).toFixed(1)} MHz, more than the receiver's 6.3 MHz`, error: true });
+    if (!this.on) this.saved = { freq: state.freq, mode: state.mode, bw: state.bw, fs: state.fs, sq: state.sq };
+    this.on = true;
+    this.owner = c;
+    this.list = list.map((x) => ({ ...x, active: false, raw: 0, lastRaw: 0, hist: [], base: null }));
+    this.frames = 0;
+    this.mode = mode;
+    this.scan = m.scan !== false;
+    this.locked = false;
+    this.cur = -1;
+    this.hang = Math.max(0, Number(m.hang ?? 2000));
+    // centre between the outer channels, nudged off any channel (the DC spike sits at the centre)
+    let centre = Math.round((lo + hi) / 2);
+    while (list.some((x) => Math.abs(x.freq - centre) < 30e3)) centre += 50e3;
+    this.lo = centre;
+    if (state.fs !== fsPick[0]) {
+      setRadio({ fs: fsPick[0] });
+      await whenReady();
+    }
+    if (state.mode !== mode) setMode(mode);
+    this.sqSet = state.sq == null;
+    if (this.sqSet) setRadio({ sq: SQ_DEFAULT[mode] ?? 6 });
+    this.tuneTo(m.start != null ? Number(m.start) : 0);
+    this.send();
+  },
+  tuneTo(i) {
+    const ch = this.list[i];
+    if (!ch) return;
+    this.cur = i;
+    tune(ch.freq, { lo: this.lo });
+  },
+  stop(restore = true) {
+    if (!this.on) return;
+    this.on = false;
+    this.owner = null;
+    const sv = this.saved;
+    this.saved = null;
+    if (restore && sv) {
+      if (this.sqSet && state.mode === this.mode) setRadio({ sq: null });
+      if (state.fs !== sv.fs) setRadio({ fs: sv.fs });
+      if (state.mode !== sv.mode) setMode(sv.mode, sv.bw);
+      tune(sv.freq);
+    }
+    this.send();
+  },
+  // Someone tuned by hand (Pi-SDR's own page): inside the span, scanning pauses on it; elsewhere, the watch ends.
+  userTuned(freq) {
+    if (!this.on) return;
+    const i = this.list.findIndex((x) => Math.abs(x.freq - freq) < 3000);
+    if (i >= 0) {
+      this.cur = i;
+      this.locked = true;
+      this.send();
+    } else this.stop(false);
+  },
+  onSpectrum(sp) {
+    if (!this.on || !sp || Math.abs(sp.lo - state.lo) > 1 || sp.fs !== state.fs || state.lo !== this.lo) return;
+    const bin = sp.fs / sp.n, w = Math.max(1, Math.round(Math.min(8000, MODE_BW[this.mode] / 2) / bin)), db = sp.db;
+    const peakAt = (i) => {
+      let pk = -128;
+      for (let k = Math.max(0, i - w); k <= Math.min(sp.n - 1, i + w); k++) if (db[k] > pk) pk = db[k];
+      return pk;
+    };
+    // Each channel against its own noise: the median of its last ~15 s (channels near the filter's edges, or with
+    // a birdie, sit a few dB apart even when silent, measured 2026-10-21). Silent channels never went more than 5 dB
+    // over theirs, so the lights need at least LIGHT_MIN_DB; the squelch slider raises it.
+    const thr = Math.max(LIGHT_MIN_DB, state.sq ?? SQ_DEFAULT[this.mode] ?? 6), now = Date.now();
+    this.frames = (this.frames || 0) + 1;
+    let changed = false;
+    for (const c of this.list) {
+      const i = Math.round((c.freq - sp.lo) / bin + sp.n / 2);
+      c.level = peakAt(i);
+      (c.hist ||= []).push(c.level);
+      if (c.hist.length > 300) c.hist.shift();
+      if (c.base == null || this.frames % 10 === 0) c.base = [...c.hist].sort((x, y) => x - y)[c.hist.length >> 1];
+      const raw = c.hist.length >= 20 && c.level > c.base + thr;
+      c.raw = raw ? c.raw + 1 : 0;
+      if (raw) c.lastRaw = now;
+      const act = c.raw >= 2 || (c.active && now - c.lastRaw < 600); // on after 2 frames, off after 0.6 s quiet
+      if (act !== c.active) (c.active = act), (changed = true);
+    }
+    if (this.scan && !this.locked) {
+      const cur = this.list[this.cur];
+      if (!cur || now - cur.lastRaw > this.hang) {
+        const i = this.list.findIndex((c) => c.scan && c.active);
+        if (i >= 0 && i !== this.cur) {
+          this.tuneTo(i);
+          changed = true;
+        }
+      }
+    }
+    if (changed) this.send();
+  },
+  command(c, m) {
+    if (m.cmd === 'watchStart') return this.start(c, m);
+    if (!this.on) return;
+    if (m.cmd === 'watchStop') this.stop(true);
+    else if (m.cmd === 'watchScan') (this.scan = !!m.on), (this.locked = false), this.send();
+    else if (m.cmd === 'watchLock') (this.locked = !!m.on), this.send();
+    else if (m.cmd === 'watchTune') {
+      this.locked = m.lock !== false;
+      this.tuneTo(Number(m.i));
+      this.send();
+    }
+  },
+  clientGone(c) {
+    if (this.on && this.owner === c) this.stop(true);
+  },
 };
 
 // ---- ham band survey: how busy is each HF band right now ----------------------------------------------------------
@@ -1137,6 +1286,7 @@ wss.on('connection', (ws, req) => {
   clients.add(c);
   log('client connected', c.ip, clients.size);
   ws.send(JSON.stringify(publicState()));
+  if (watch.on) ws.send(JSON.stringify(watch.info()));
   if (status.type) ws.send(JSON.stringify(status));
   ws.send(JSON.stringify({ type: 'hits', hits: hits.slice(0, 100) }));
   ws.send(JSON.stringify({ type: 'decodeHistory', history: decoders.history }));
@@ -1146,6 +1296,7 @@ wss.on('connection', (ws, req) => {
   });
   ws.on('close', () => {
     clients.delete(c);
+    watch.clientGone(c);
     updateAudioFlag();
     broadcastJson({ type: 'clients', clients: clients.size, listeners: listeners() });
   });
