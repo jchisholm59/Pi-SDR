@@ -900,14 +900,15 @@ const scanner = {
 // Every spectrum frame (20/s) gives each channel's level, so all of them light up within ~0.1 s of a transmission,
 // with no retuning. The span is chosen to hold them all (the RSPduo's IF filter: 1.536 MHz at 2.4 MS/s, 5 MHz at 6,
 // 7 MHz at 8). Scan: the receiver follows the first active channel (list order = priority) and stays HANG ms after it
-// goes quiet. Threshold = the squelch (dB above the noise), so one slider sets both. The client that started it owns
-// it: when it stops or disconnects, the receiver goes back to how it was.
+// goes quiet. Threshold = the squelch (dB above the noise), so one slider sets both. Every client listening with
+// the same channels shares it; when the last one stops or disconnects, the receiver goes back to how it was. A start
+// with other channels (the Ships panel while Planes listens) takes it over, and the others are told.
 const WATCH_FS = [[2.4e6, 1.536e6], [6e6, 5e6], [8e6, 7e6]];
 const SQ_DEFAULT = { am: 6, nfm: 4 }; // when the mode has no squelch of its own
 const LIGHT_MIN_DB = 6; // channel lights: at least this far over the channel's own noise
 const LIGHT_BAND_DB = 12; // ...or this far over the band's
 const watch = {
-  on: false, owner: null, list: [], mode: 'am', scan: true, locked: false, cur: -1, hang: 2000, saved: null, sqSet: false, lo: 0,
+  on: false, watchers: new Set(), list: [], mode: 'am', scan: true, locked: false, cur: -1, hang: 2000, saved: null, sqSet: false, lo: 0,
   info() {
     return { type: 'watch', on: this.on, scan: this.scan, locked: this.locked, cur: this.cur, mode: this.mode,
       ch: this.list.map((c) => ({ name: c.name, freq: c.freq, active: c.active, scan: c.scan })) };
@@ -920,6 +921,15 @@ const watch = {
       .filter((x) => x.freq > 1e6).slice(0, 24);
     if (!list.length) return;
     if (playback) return broadcastJson({ type: 'toast', msg: 'Stop the IQ playback first', error: true });
+    // the same channels already watched: join in
+    const key = (l) => l.map((x) => x.freq).join(',');
+    if (this.on && key(this.list) === key(list) && (MODE_BW[m.mode] ? m.mode : 'am') === this.mode) {
+      this.watchers.add(c);
+      if (c.ws.readyState === 1) c.ws.send(JSON.stringify(this.info()));
+      return;
+    }
+    // other channels: take over; the panels listening so far stop
+    for (const o of this.watchers) if (o !== c && o.ws.readyState === 1) o.ws.send(JSON.stringify({ ...this.info(), on: false, reason: 'taken' }));
     scanner.stop();
     const mode = MODE_BW[m.mode] ? m.mode : 'am';
     const lo = Math.min(...list.map((x) => x.freq)), hi = Math.max(...list.map((x) => x.freq)), half = MODE_BW[mode];
@@ -927,7 +937,7 @@ const watch = {
     if (!fsPick) return broadcastJson({ type: 'toast', msg: `Listen: channels span ${((hi - lo) / 1e6).toFixed(1)} MHz, more than the receiver's 6.3 MHz`, error: true });
     if (!this.on) this.saved = { freq: state.freq, mode: state.mode, bw: state.bw, fs: state.fs, sq: state.sq };
     this.on = true;
-    this.owner = c;
+    this.watchers = new Set([c]);
     this.list = list.map((x) => ({ ...x, active: false, raw: 0, lastRaw: 0, hist: [], base: null }));
     this.frames = 0;
     this.mode = mode;
@@ -958,7 +968,7 @@ const watch = {
   stop(restore = true) {
     if (!this.on) return;
     this.on = false;
-    this.owner = null;
+    this.watchers.clear();
     const sv = this.saved;
     this.saved = null;
     if (restore && sv) {
@@ -1028,7 +1038,7 @@ const watch = {
   command(c, m) {
     if (m.cmd === 'watchStart') return this.start(c, m);
     if (!this.on) return;
-    if (m.cmd === 'watchStop') this.stop(true);
+    if (m.cmd === 'watchStop') this.leave(c);
     else if (m.cmd === 'watchScan') (this.scan = !!m.on), (this.locked = false), this.send();
     else if (m.cmd === 'watchLock') (this.locked = !!m.on), this.send();
     else if (m.cmd === 'watchSkip') {
@@ -1042,8 +1052,13 @@ const watch = {
       this.send();
     }
   },
+  // A listener leaves (Stop, or its page went away): the last one out puts the receiver back.
+  leave(c) {
+    if (!this.on || !this.watchers.delete(c)) return;
+    if (!this.watchers.size) this.stop(true);
+  },
   clientGone(c) {
-    if (this.on && this.owner === c) this.stop(true);
+    this.leave(c);
   },
 };
 
