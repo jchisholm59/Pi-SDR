@@ -732,15 +732,16 @@ function draw(full) {
     g.fillText(lbl, x + 3 * dpr, H - 4 * dpr);
   }
   // passband
+  let pbX0 = 0, pbX1 = 0;
   if (S) {
     const bw = S.mode === 'wfm' ? 180000 : S.bw;
     let lo = S.freq - bw / 2, hi = S.freq + bw / 2;
     if (S.mode === 'usb') (lo = S.freq + 200), (hi = S.freq + 200 + bw);
     if (S.mode === 'lsb') (lo = S.freq - 200 - bw), (hi = S.freq - 200);
     if (S.mode === 'cw') (lo = S.freq - bw / 2), (hi = S.freq + bw / 2);
-    const x0 = fToX(lo), x1 = fToX(hi);
+    (pbX0 = fToX(lo)), (pbX1 = fToX(hi));
     g.fillStyle = 'rgba(41,182,246,.13)';
-    g.fillRect(x0, 0, Math.max(1, x1 - x0), H);
+    g.fillRect(pbX0, 0, Math.max(1, pbX1 - pbX0), H);
   }
   // trace
   const col = columns(spec.db);
@@ -766,6 +767,32 @@ function draw(full) {
     g.strokeStyle = 'rgba(255,202,40,.6)';
     g.lineWidth = 1;
     g.stroke();
+  }
+  // squelch level: the engine opens when the channel is sq dB above its noise, and the per-bin floor scales to the
+  // channel the same way a signal filling the passband does, so floor + sq is where such a signal opens it.
+  // Dashed across the view, solid over the passband; amber while closed, green while open.
+  if (S?.sq && st.floor != null) {
+    const y = Math.round(yOf(st.floor + S.sq)) + 0.5, c = st.sqOpen ? '#66bb6a' : '#ffa726';
+    g.strokeStyle = c;
+    g.globalAlpha = 0.55;
+    g.lineWidth = 1 * dpr;
+    g.setLineDash([4 * dpr, 4 * dpr]);
+    g.beginPath();
+    g.moveTo(0, y);
+    g.lineTo(W, y);
+    g.stroke();
+    g.setLineDash([]);
+    g.globalAlpha = 1;
+    g.lineWidth = 2 * dpr;
+    g.beginPath();
+    g.moveTo(pbX0, y);
+    g.lineTo(Math.max(pbX0 + 1, pbX1), y);
+    g.stroke();
+    g.font = `${10.5 * dpr}px system-ui, sans-serif`;
+    g.fillStyle = c;
+    g.textAlign = 'right';
+    g.fillText(`SQL +${S.sq} dB`, W - 6 * dpr, y - 4 * dpr);
+    g.textAlign = 'left';
   }
   // labels: FM stations and memories
   if ($('showMem').checked) {
