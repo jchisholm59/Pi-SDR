@@ -905,6 +905,7 @@ const scanner = {
 const WATCH_FS = [[2.4e6, 1.536e6], [6e6, 5e6], [8e6, 7e6]];
 const SQ_DEFAULT = { am: 6, nfm: 4 }; // when the mode has no squelch of its own
 const LIGHT_MIN_DB = 6; // channel lights: at least this far over the channel's own noise
+const LIGHT_BAND_DB = 12; // ...or this far over the band's
 const watch = {
   on: false, owner: null, list: [], mode: 'am', scan: true, locked: false, cur: -1, hang: 2000, saved: null, sqSet: false, lo: 0,
   info() {
@@ -990,6 +991,12 @@ const watch = {
     // a birdie, sit a few dB apart even when silent, measured 2026-10-21). Silent channels never went more than 5 dB
     // over theirs, so the lights need at least LIGHT_MIN_DB; the squelch slider raises it.
     const thr = Math.max(LIGHT_MIN_DB, state.sq ?? SQ_DEFAULT[this.mode] ?? 6), now = Date.now();
+    // ...or well over the whole band's noise (the median window peak across the passband): a continuous station
+    // (marine weather, ATIS) is its own baseline, so only this lights it. Silent channels stayed <= 8 dB over it.
+    const a = Math.round(sp.n * 0.12), b = Math.round(sp.n * 0.88), pks = [];
+    for (let k = a; k < b; k += 2 * w + 1) pks.push(peakAt(k));
+    pks.sort((x, y) => x - y);
+    const band = (pks[pks.length >> 1] ?? -100) + Math.max(LIGHT_BAND_DB, thr);
     this.frames = (this.frames || 0) + 1;
     let changed = false;
     for (const c of this.list) {
@@ -998,7 +1005,7 @@ const watch = {
       (c.hist ||= []).push(c.level);
       if (c.hist.length > 300) c.hist.shift();
       if (c.base == null || this.frames % 10 === 0) c.base = [...c.hist].sort((x, y) => x - y)[c.hist.length >> 1];
-      const raw = c.hist.length >= 20 && c.level > c.base + thr;
+      const raw = (c.hist.length >= 20 && c.level > c.base + thr) || c.level > band;
       c.raw = raw ? c.raw + 1 : 0;
       if (raw) c.lastRaw = now;
       const act = c.raw >= 2 || (c.active && now - c.lastRaw < 600); // on after 2 frames, off after 0.6 s quiet
