@@ -1040,6 +1040,14 @@ const server = http.createServer((req, res) => {
   };
   if (p === '/api/state') return json(publicState());
   if (p === '/api/status') return json({ status, rds, engine: engineUp, device });
+  // Flat summary for dashboards (Homepage's customapi can't read a field inside rds when it's null, off broadcast FM).
+  if (p === '/api/summary') {
+    const f = state.freq, near = (x) => Math.abs(x.freq - f) < 5000;
+    const fmSt = state.mode === 'wfm' ? (fm.stations || []).find(near) : null;
+    const id = ident.lookup(f, state.mode).sort((a, b) => (b.onAir === true) - (a.onAir === true) || (a.km ?? 0) - (b.km ?? 0))[0];
+    const station = (state.mode === 'wfm' && rds?.ps?.trim()) || fmSt?.name || fmSt?.ps || memories.find(near)?.name || id?.name || '';
+    return json({ freq: f / 1e6, mode: state.mode.toUpperCase(), station, listeners: listeners(), clients: clients.size });
+  }
   if (p === '/api/memories') return json(memories);
   if (p === '/api/fm') return json(fm);
   if (p === '/api/search') return json(lastSearch);
