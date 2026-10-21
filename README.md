@@ -27,6 +27,12 @@ and the radio, the spectrum and the audio come to you. Covers everything the RSP
   language or station, tap to tune; on-air stations are labelled on the spectrum.
 - **Search**: sweep any range (the whole 1 kHz – 2 GHz takes about a minute), list the active channels on a grid with
   their level above the noise, listen, save selected or all to memories.
+- **Watch mode** (for other apps): a handful of channels inside one span checked on every spectrum frame, all at
+  once, so each one's activity is known within ~0.1 s with no retuning; a scan that follows whichever is talking, lock,
+  and per-channel skip. The span and sample rate (2.4 / 6 / 8 MS/s) are chosen to fit the channels. Used by the
+  **Listen** panels of [adsb-monitor](https://github.com/jchisholm59/adsb-monitor)'s Planes card (airband) and
+  [ais-monitor](https://github.com/jchisholm59/ais-monitor)'s Ships card (marine VHF): channel lights, Scan, Lock,
+  squelch. Every listener on the same channels shares it; the last one out puts the receiver back as it was.
 - **Scanner**: step through a range, a memory group or the last search; stops on activity and either listens until the
   signal has been gone for the hang time and moves on, or **locks on it** until you press Resume; Hold, Skip, lock out
   (remembered), save; every stop logged.
@@ -123,10 +129,17 @@ Hubley NS by default), `AIR_RADIUS_KM` (250).
 
 ## API
 
-`GET /api/state`, `/api/status` (levels, gain, load), `/api/memories`, `/api/fm`, `/api/search`, `/api/hits`,
+`GET /api/state`, `/api/status` (levels, gain, load), `/api/summary` (flat `{freq (MHz), mode, station,
+listeners, clients}` for dashboards such as Homepage's customapi widget), `/api/memories`, `/api/fm`, `/api/search`, `/api/hits`,
 `/api/ident?f=<Hz>`, `/api/onair?start=&end=[&all=1]`, `/api/recordings`, `/rec/<file>` (Range), `/api/export`;
 `POST /api/import`. Everything else goes over
 the WebSocket at `/ws` (JSON commands: `tune`, `mode`, `set`, `audio`, `search`, `scanStart`, `fmScan`, …).
+Watch mode: `{cmd: "watchStart", channels: [{name, freq (Hz), scan}], mode, scan, start}`, then `watchScan {on}`,
+`watchLock {on}`, `watchTune {i, lock}`, `watchSkip {i, scan}`, `watchStop`; the server broadcasts
+`{type: "watch", on, scan, locked, cur, mode, ch: [{name, freq, active, scan}]}` whenever a channel's activity or the
+current channel changes (`on: false, reason: "taken"` to listeners whose watch another set of channels replaced).
+Activity: a channel's level at least 6 dB (or the squelch) over its own median of the last ~15 s, or 12 dB over the
+band's noise (a continuous station); on after 2 frames, off after 0.6 s.
 
 ## Notes
 
