@@ -1013,8 +1013,10 @@ const watch = {
     }
     if (this.scan && !this.locked) {
       const cur = this.list[this.cur];
-      if (!cur || now - cur.lastRaw > this.hang) {
-        const i = this.list.findIndex((c) => c.scan && c.active);
+      if (!cur || !cur.scan || now - cur.lastRaw > this.hang) {
+        // the first active channel; on a skipped one (just ruled out), the first scanned channel to wait on
+        let i = this.list.findIndex((c) => c.scan && c.active);
+        if (i < 0 && cur && !cur.scan) i = this.list.findIndex((c) => c.scan);
         if (i >= 0 && i !== this.cur) {
           this.tuneTo(i);
           changed = true;
