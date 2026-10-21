@@ -473,6 +473,7 @@ async function onClientMessage(c, msg) {
       case 'watchScan':
       case 'watchLock':
       case 'watchTune':
+      case 'watchSkip':
         await watch.command(c, m);
         break;
       case 'mode':
@@ -1021,6 +1022,11 @@ const watch = {
     if (m.cmd === 'watchStop') this.stop(true);
     else if (m.cmd === 'watchScan') (this.scan = !!m.on), (this.locked = false), this.send();
     else if (m.cmd === 'watchLock') (this.locked = !!m.on), this.send();
+    else if (m.cmd === 'watchSkip') {
+      // a channel in or out of the scan (e.g. a continuous weather broadcast)
+      const ch = this.list[Number(m.i)];
+      if (ch) (ch.scan = !!m.scan), this.send();
+    }
     else if (m.cmd === 'watchTune') {
       this.locked = m.lock !== false;
       this.tuneTo(Number(m.i));
